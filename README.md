@@ -153,6 +153,8 @@ known composition does not add an evaluation. STCH artifacts interleave the two
 weight runs by local evaluation index, so their pooled initial-design boundary
 is 10 evaluations. Corresponding direct and composite methods use matched
 seeds, initial designs, weights, per-weight seeds, and posterior-sampler seeds.
+Posterior-sampler seeds use separate trial and weight strides, so paired methods
+share streams within a trial without reusing them across trials.
 
 For every problem, all methods and trials use the same fixed hypervolume
 reference point:
@@ -332,7 +334,8 @@ MAX_CONCURRENT=32 bash run_unicorn.sh
 | 320-worker array | `default_partition`, 1 CPU, 4 GB, 4 hours, requeue | setup `afterok` |
 | Aggregate | `default_partition`, 1 CPU, 4 GB, 1 hour, requeue | array `afterany` |
 
-The aggregate job validates all 320 artifacts, writes eight pairwise PNGs and
+The aggregate job validates all 320 artifacts and all 20 compatible trial pairs
+per method family, writes eight pairwise PNGs and
 `output/timing_fallback_summary.json`, then creates
 `$RUN/composite-mobo-$COMMIT.tgz`. Retrieve that archive from the login node:
 

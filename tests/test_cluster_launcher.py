@@ -123,6 +123,9 @@ esac
         assert option in aggregate
     assert "COMPOSITE_MOBO_COMMIT" in array
     assert "_validated_payload" in aggregate
+    assert "load_traces" in aggregate
+    assert "paired trials" in aggregate
+    assert "shape[0] != args.trials" in aggregate
     assert "--summary-only" in aggregate
     assert "min(len(rows), 320)" in aggregate
     assert "max(len(rows), 320)" in aggregate

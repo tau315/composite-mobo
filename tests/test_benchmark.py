@@ -398,8 +398,8 @@ def test_all_acquisitions_use_matched_seeded_mc_samplers_and_count_fallbacks(
         ),
     )
 
-    assert qlog_samplers == [((13,), 13), ((13,), 14)] * 2
-    assert qei_samplers == [((13,), 12), ((13,), 104741)] * 2
+    assert qlog_samplers == [((13,), 1100035), ((13,), 1100036)] * 2
+    assert qei_samplers == [((13,), 1100034), ((13,), 1204763)] * 2
     assert [result.acquisition_fallbacks for result in qlog_results] == [2, 2]
     assert [result.acquisition_fallbacks for result in stch_results] == [2, 2]
 

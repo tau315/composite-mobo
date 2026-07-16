@@ -169,6 +169,9 @@ import benchmark
 tasks_path, results_dir, summary_path = map(Path, sys.argv[1:])
 rows = [line.split("\t") for line in tasks_path.read_text(encoding="utf-8").splitlines()]
 args = Namespace(
+    problems=("zdt1", "zdt2", "zdt3", "dtlz2"),
+    trials=20,
+    results_dir=results_dir,
     dim=6,
     budget=40,
     initial=5,
@@ -204,6 +207,19 @@ if bad:
     print("bad/retry indices: " + ",".join(dict.fromkeys(bad)))
     raise SystemExit(1)
 print("bad/retry indices: none")
+traces = benchmark.load_traces(args)
+labels = set(benchmark.METHOD_LABELS.values())
+incompatible = []
+for problem in args.problems:
+    methods = traces.get(problem, {})
+    if set(methods) != labels or any(
+        trace.shape[0] != args.trials for trace in methods.values()
+    ):
+        incompatible.append(problem)
+if incompatible:
+    print("incomplete paired trials: " + ",".join(incompatible))
+    raise SystemExit(1)
+print("paired trials: 20 per family/problem")
 summary = {
     "artifacts": len(payloads),
     "timing_totals_seconds": {

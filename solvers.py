@@ -205,7 +205,7 @@ def standard_mobo(
             ref_point=ref_max.tolist(),
             partitioning=partitioning,
             sampler=SobolQMCNormalSampler(
-                torch.Size([mc_samples]), seed=seed + len(X)
+                torch.Size([mc_samples]), seed=seed * 100003 + len(X)
             ),
         )
         timing["acquisition_build_seconds"] += (
@@ -277,7 +277,7 @@ def composite_mobo(
             partitioning=partitioning,
             objective=objective,
             sampler=SobolQMCNormalSampler(
-                torch.Size([mc_samples]), seed=seed + len(X)
+                torch.Size([mc_samples]), seed=seed * 100003 + len(X)
             ),
         )
         timing["acquisition_build_seconds"] += (
@@ -366,7 +366,8 @@ def _scalarized_runs(
                     best_f=observed_utility.max(),
                     objective=objective,
                     sampler=SobolQMCNormalSampler(
-                        torch.Size([mc_samples]), seed=run_seed + len(X)
+                        torch.Size([mc_samples]),
+                        seed=seed * 100003 + 104729 * run_id + len(X),
                     ),
                 )
             else:
@@ -383,7 +384,8 @@ def _scalarized_runs(
                     best_f=observed_utility.max(),
                     objective=objective,
                     sampler=SobolQMCNormalSampler(
-                        torch.Size([mc_samples]), seed=run_seed + len(X)
+                        torch.Size([mc_samples]),
+                        seed=seed * 100003 + 104729 * run_id + len(X),
                     ),
                 )
             timing["acquisition_build_seconds"] += (
