@@ -203,6 +203,7 @@ def _valid_result(path: Path, expected: dict) -> bool:
         config = payload["config"]
         metadata = payload["metadata"]
         timing = payload["timing"]
+        method = payload["method"]
         budget = expected["budget"]
         trial = int(path.stem.removeprefix("trial"))
         return (
@@ -231,6 +232,7 @@ def _valid_result(path: Path, expected: dict) -> bool:
             )
             and type(config["seed"]) is int
             and budget >= config["initial"]
+            and budget % config["weights"] == 0
             and payload["seed"] == config["seed"]
             and isinstance(metadata, dict)
             and {"python", "packages", "git_commit"} <= metadata.keys()
@@ -243,29 +245,23 @@ def _valid_result(path: Path, expected: dict) -> bool:
             )
             and payload["failed"] is None
             and matrix(payload["X"], budget, config["dim"])
-            and matrix(payload["Y"], budget)
+            and matrix(payload["Y"], budget, 2)
             and (
-                payload["components"] is None
-                or matrix(payload["components"], budget)
+                matrix(payload["components"], budget)
+                if method.startswith("composite_")
+                else payload["components"] is None
             )
             and (
-                payload["weights"] is None
-                or matrix(
-                    payload["weights"],
-                    len(payload["weights"]),
-                    len(payload["Y"][0]),
+                (
+                    matrix(payload["weights"], config["weights"], 2)
+                    and isinstance(payload["run_ids"], list)
+                    and all(type(value) is int for value in payload["run_ids"])
+                    and payload["run_ids"]
+                    == list(range(config["weights"]))
+                    * (budget // config["weights"])
                 )
-            )
-            and (
-                payload["run_ids"] is None
-                or (
-                    isinstance(payload["run_ids"], list)
-                    and len(payload["run_ids"]) == budget
-                    and all(
-                        type(value) is int and value >= 0
-                        for value in payload["run_ids"]
-                    )
-                )
+                if method.endswith("_stch")
+                else payload["weights"] is None and payload["run_ids"] is None
             )
             and vector(payload["hypervolume"], budget)
             and vector(payload["wall_seconds"], budget, nonnegative=True)

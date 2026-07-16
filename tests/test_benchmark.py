@@ -36,7 +36,9 @@ def _benchmark_args(tmp_path, **overrides):
     return Namespace(**values)
 
 
-def _fake_solver_result(budget=2, dim=2):
+def _fake_solver_result(
+    method="standard_qlogehvi", budget=2, dim=2, weights=1
+):
     return solvers.SolverResult(
         X=torch.zeros((budget, dim), dtype=torch.double),
         Y=torch.column_stack(
@@ -45,9 +47,21 @@ def _fake_solver_result(budget=2, dim=2):
                 torch.linspace(0.0, 1.0, budget, dtype=torch.double),
             )
         ),
-        components=torch.zeros((budget, 1), dtype=torch.double),
-        weights=torch.tensor([[0.5, 0.5]], dtype=torch.double),
-        run_ids=torch.zeros(budget, dtype=torch.long),
+        components=(
+            torch.zeros((budget, 1), dtype=torch.double)
+            if method.startswith("composite_")
+            else None
+        ),
+        weights=(
+            torch.full((weights, 2), 0.5, dtype=torch.double)
+            if method.endswith("_stch")
+            else None
+        ),
+        run_ids=(
+            torch.arange(weights).repeat(budget // weights)
+            if method.endswith("_stch")
+            else None
+        ),
         timing=dict.fromkeys(solvers.TIMING_KEYS, 0.0),
         wall_seconds=[0.01] * budget,
     )
@@ -96,6 +110,21 @@ def _artifact(config=None, **overrides):
         ),
         "failed": None,
     }
+    payload.update(overrides)
+    return payload
+
+
+def _method_artifact(method, config=None, **overrides):
+    config = config or _artifact_config(budget=4, weights=2)
+    budget = config["budget"]
+    payload = _artifact(config, method=method)
+    if method.startswith("composite_"):
+        payload["components"] = [[float(i)] for i in range(budget)]
+    if method.endswith("_stch"):
+        payload["weights"] = [[0.5, 0.5]] * config["weights"]
+        payload["run_ids"] = list(range(config["weights"])) * (
+            budget // config["weights"]
+        )
     payload.update(overrides)
     return payload
 
@@ -293,6 +322,63 @@ def test_atomic_artifact_and_strict_resume_validation(tmp_path):
     assert not benchmark._valid_result(path, _artifact_config(seed=8))
 
 
+@pytest.mark.parametrize("method", tuple(benchmark.METHOD_LABELS))
+def test_resume_validation_accepts_method_result_shapes(tmp_path, method):
+    config = _artifact_config(budget=4, weights=2)
+    path = tmp_path / "zdt1" / method / "trial0.json"
+    benchmark._atomic_write_json(path, _method_artifact(method, config))
+
+    assert benchmark._valid_result(path, config)
+
+
+@pytest.mark.parametrize(
+    ("method", "overrides"),
+    (
+        ("standard_qlogehvi", {"Y": [[0.0, 1.0, 2.0]] * 4}),
+        ("composite_qlogehvi", {"components": None}),
+        ("composite_stch", {"components": [[0.0]] * 3}),
+        (
+            "composite_qlogehvi",
+            {"components": [[0.0], [1.0], [float("nan")], [3.0]]},
+        ),
+        ("standard_qlogehvi", {"components": [[0.0]] * 4}),
+        ("objective_gp_stch", {"components": [[0.0]] * 4}),
+        ("objective_gp_stch", {"weights": None}),
+        ("composite_stch", {"weights": [[0.5, 0.5]]}),
+        ("objective_gp_stch", {"weights": [[0.2, 0.3, 0.5]] * 2}),
+        ("composite_stch", {"run_ids": None}),
+        ("objective_gp_stch", {"run_ids": [0, 0, 1, 1]}),
+        ("objective_gp_stch", {"run_ids": [0, 1, 0]}),
+        ("standard_qlogehvi", {"weights": [[0.5, 0.5]] * 2}),
+        ("composite_qlogehvi", {"run_ids": [0, 1, 0, 1]}),
+    ),
+)
+def test_resume_validation_rejects_method_incompatible_results(
+    tmp_path, method, overrides
+):
+    config = _artifact_config(budget=4, weights=2)
+    path = tmp_path / "zdt1" / method / "trial0.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(_method_artifact(method, config, **overrides)),
+        encoding="utf-8",
+    )
+
+    assert not benchmark._valid_result(path, config)
+
+
+@pytest.mark.parametrize("method", tuple(benchmark.METHOD_LABELS))
+def test_resume_validation_rejects_nondivisible_budget(tmp_path, method):
+    config = _artifact_config(budget=3, weights=2)
+    path = tmp_path / "zdt1" / method / "trial0.json"
+    payload = _method_artifact(method, config)
+    if method.endswith("_stch"):
+        payload["run_ids"] = [0, 1, 0]
+    benchmark._atomic_write_json(path, payload)
+
+    assert not benchmark._valid_result(path, config)
+
+
 def test_resume_validation_never_raises_and_rejects_malformed_artifacts(tmp_path):
     path = tmp_path / "zdt1" / "standard_qlogehvi" / "trial0.json"
     config = _artifact_config()
@@ -395,7 +481,7 @@ def test_one_job_failure_writes_traceback_and_does_not_abort_siblings(
     def succeed(method):
         def job(*args, **kwargs):
             calls.append(method)
-            return _fake_solver_result()
+            return _fake_solver_result(method)
 
         return job
 
@@ -429,9 +515,15 @@ def test_one_job_failure_writes_traceback_and_does_not_abort_siblings(
             assert not benchmark._valid_result(path, payload["config"])
         else:
             assert payload["failed"] is None
-            assert payload["components"] == [[0.0], [0.0]]
-            assert payload["weights"] == [[0.5, 0.5]]
-            assert payload["run_ids"] == [0, 0]
+            assert payload["components"] == (
+                [[0.0], [0.0]] if method.startswith("composite_") else None
+            )
+            assert payload["weights"] == (
+                [[0.5, 0.5]] if method.endswith("_stch") else None
+            )
+            assert payload["run_ids"] == (
+                [0, 0] if method.endswith("_stch") else None
+            )
             assert payload["wall_seconds"] == [0.01, 0.01]
             assert benchmark._valid_result(path, payload["config"])
 
@@ -458,17 +550,20 @@ def test_nonfinite_result_writes_finite_failure_and_continues_siblings(
     monkeypatch.setattr(
         benchmark,
         "composite_mobo",
-        solver("composite_qlogehvi", _fake_solver_result()),
+        solver(
+            "composite_qlogehvi",
+            _fake_solver_result("composite_qlogehvi"),
+        ),
     )
     monkeypatch.setattr(
         benchmark,
         "chebyshev_bo",
-        solver("objective_gp_stch", _fake_solver_result()),
+        solver("objective_gp_stch", _fake_solver_result("objective_gp_stch")),
     )
     monkeypatch.setattr(
         benchmark,
         "composite_chebyshev_bo",
-        solver("composite_stch", _fake_solver_result()),
+        solver("composite_stch", _fake_solver_result("composite_stch")),
     )
 
     benchmark.run(_benchmark_args(tmp_path))
@@ -487,9 +582,9 @@ def test_nonfinite_result_writes_finite_failure_and_continues_siblings(
 def _write_pair_artifact(tmp_path, method, trial, config, values):
     benchmark._atomic_write_json(
         tmp_path / "zdt1" / method / f"trial{trial}.json",
-        _artifact(
+        _method_artifact(
+            method,
             config,
-            method=method,
             trial=trial,
             hypervolume=values,
         ),
@@ -619,7 +714,7 @@ def test_zdt2_uses_five_initial_points_and_thirty_total(tmp_path, monkeypatch):
     def solver(method):
         def job(*args, **kwargs):
             calls[method] = (kwargs["n_init"], kwargs["n_iter"])
-            return _fake_solver_result(budget=30)
+            return _fake_solver_result(method, budget=30, weights=2)
 
         return job
 
