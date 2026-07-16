@@ -6,18 +6,18 @@ optimization (MOBO).
 
 The central comparison is between learning final objectives directly,
 
-\[
+$$
 \mathbf{x}\longrightarrow \bigl(f_1(\mathbf{x}),f_2(\mathbf{x})\bigr),
-\]
+$$
 
 and learning an observable inner response before applying a known outer map,
 
-\[
+$$
 \mathbf{x}\longrightarrow h(\mathbf{x})
 \longrightarrow
 \Phi\bigl(h(\mathbf{x}),\mathbf{x}\bigr)
 =\bigl(f_1(\mathbf{x}),f_2(\mathbf{x})\bigr).
-\]
+$$
 
 The benchmark measures Pareto-front recovery using dominated hypervolume versus
 the total number of expensive function evaluations.
@@ -47,11 +47,11 @@ given artificial GP uncertainty.
 `chebyshev_bo` fits the final objectives directly. For each preference weight,
 posterior objective samples are transformed using
 
-\[
+$$
 S_{\tau,\mathbf{w}}(\mathbf{f})
 =\tau\log\sum_i
 \exp\left(\frac{w_i(f_i-z_i^\star)}{\tau}\right).
-\]
+$$
 
 Because the benchmarks are minimization problems, the acquisition utility is
 `-S`. A separate qLogEI run is performed for each weight.
@@ -62,11 +62,11 @@ Because the benchmarks are minimization problems, the acquisition utility is
 posterior samples through both the known objective map and smooth Tchebycheff
 scalarization:
 
-\[
+$$
 \mathbf{x}\rightarrow h(\mathbf{x})
 \rightarrow\mathbf{f}(\mathbf{x})
 \rightarrow S_{\tau,\mathbf{w}}(\mathbf{f}(\mathbf{x})).
-\]
+$$
 
 This is the fully nested composite method.
 
@@ -79,17 +79,17 @@ All inputs are bounded to `[0, 1]^d`; the default dimension is six.
 
 The ZDT problems share
 
-\[
+$$
 g(\mathbf{x})=1+\frac{9}{d-1}\sum_{j=2}^{d}x_j,
 \qquad f_1(\mathbf{x})=x_1.
-\]
+$$
 
 The direct methods fit GPs to `f1` and `f2`. The current composite methods fit
 one GP to
 
-\[
+$$
 u(\mathbf{x})=\log g(\mathbf{x})
-\]
+$$
 
 and reconstruct `g = exp(u)`. This warped representation guarantees positive
 posterior component samples for outer functions that divide by `g`. It is not
@@ -104,15 +104,15 @@ reported when interpreting results.
 
 For two objectives and six inputs,
 
-\[
+$$
 g(\mathbf{x})=\sum_{j=2}^{6}(x_j-0.5)^2,
-\]
+$$
 
-\[
+$$
 f_1=(1+g)\cos(\pi x_1/2),
 \qquad
 f_2=(1+g)\sin(\pi x_1/2).
-\]
+$$
 
 The direct methods fit GPs to `f1` and `f2`. The composite methods fit one GP
 directly to `g` and use the exact candidate coordinate `x1` in the known outer
@@ -257,4 +257,3 @@ README.md              Project documentation
 - ZDT composite models use `log(g)`, while DTLZ2 models `g` directly.
 - Two scalarization weights mostly target the ends of the Pareto front.
 - Standard-error bands are descriptive and are not formal significance tests.
-
