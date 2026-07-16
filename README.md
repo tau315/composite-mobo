@@ -285,6 +285,78 @@ ZDT2's 30-evaluation budget is fixed in the benchmark code rather than
 controlled by `--budget`; its initial count remains the global fixed value of
 five.
 
+### Unicorn 320-task run
+
+`run_unicorn.sh` submits the production matrix as 4 problems x 4 stable method
+keys x 20 trials = 320 independent Slurm array tasks. Each worker uses five
+initial points, two STCH weights, temperature 0.05, seed base 0, 128 raw
+starts, 8 restarts, and 512 MC samples. `benchmark.py` remains the single owner
+of the budget protocol: 40 evaluations normally and 30 for ZDT2.
+
+Create the exact source archive locally and copy it with the launcher to the
+Unicorn login node:
+
+```bash
+COMMIT=$(git rev-parse HEAD)
+git archive --format=tar.gz --output "composite-mobo-$COMMIT-src.tgz" "$COMMIT"
+sha256sum "composite-mobo-$COMMIT-src.tgz"
+scp run_unicorn.sh "composite-mobo-$COMMIT-src.tgz" \
+  <netid>@unicorn-login-01.coecis.cornell.edu:
+```
+
+Cornell VPN is required before SSH when off campus. On the login node, choose
+an NFS-backed `RUN` path; do not use node-local scratch. The launcher only
+writes run files and submits jobs there. Conda creation, package installation,
+and the full test suite run inside the scheduled setup job.
+
+```bash
+export COMMIT=<exact-commit-sha>
+export RUN=$HOME/composite-mobo/runs/$COMMIT-$(date +%Y%m%d-%H%M%S)
+export REPO_ARCHIVE=$HOME/composite-mobo-$COMMIT-src.tgz
+export REPO_ARCHIVE_SHA256=<sha256-from-local-machine>
+bash run_unicorn.sh
+```
+
+`ENV` defaults to `$HOME/composite-mobo/env`, so all jobs share one pinned
+Python 3.12 environment. By default the array is unthrottled (`0-319`) and
+Slurm applies site/account limits. Set `MAX_CONCURRENT` to a positive integer
+only when an explicit cap is needed:
+
+```bash
+MAX_CONCURRENT=32 bash run_unicorn.sh
+```
+
+| Stage | Slurm request | Dependency |
+| --- | --- | --- |
+| Setup | `default_partition`, 2 CPUs, 8 GB, 1 hour, requeue | none |
+| 320-worker array | `default_partition`, 1 CPU, 4 GB, 4 hours, requeue | setup `afterok` |
+| Aggregate | `default_partition`, 1 CPU, 4 GB, 1 hour, requeue | array `afterany` |
+
+The aggregate job validates all 320 artifacts, writes eight pairwise PNGs and
+`output/timing_fallback_summary.json`, then creates
+`$RUN/composite-mobo-$COMMIT.tgz`. Retrieve that archive from the login node:
+
+```bash
+scp <netid>@unicorn-login-01.coecis.cornell.edu:\
+~/composite-mobo/runs/<run>/composite-mobo-$COMMIT.tgz .
+```
+
+Workers write atomically, and strict-current resume skips already valid
+artifacts. If aggregation prints `bad/retry indices`, resubmit only that comma-
+separated index list, then schedule aggregation after the retry array:
+
+```bash
+BAD=3,41,207
+retry=$(sbatch --parsable --array="$BAD" \
+  --output="$RUN/logs/retry-%A_%a.out" --error="$RUN/logs/retry-%A_%a.err" \
+  "$RUN/array.sbatch" "$RUN/run.env")
+retry=${retry%%;*}
+sbatch --dependency="afterany:$retry" \
+  --output="$RUN/logs/aggregate-retry-%j.out" \
+  --error="$RUN/logs/aggregate-retry-%j.err" \
+  "$RUN/aggregate.sbatch" "$RUN/run.env"
+```
+
 ### Artifact fields
 
 Each schema-version-2 JSON artifact records the problem, stable method key,

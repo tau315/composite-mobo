@@ -431,6 +431,17 @@ def test_resume_validation_requires_exact_current_provenance(tmp_path, field):
     assert not benchmark._valid_result(path, payload["config"])
 
 
+def test_run_metadata_prefers_cluster_commit(monkeypatch):
+    monkeypatch.setenv("COMPOSITE_MOBO_COMMIT", "cluster-commit")
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("queried git despite cluster commit"),
+    )
+
+    assert benchmark._run_metadata()["git_commit"] == "cluster-commit"
+
+
 def test_resume_validation_recomputes_problem_outputs_and_hypervolume(tmp_path):
     path = tmp_path / "zdt1" / "composite_stch" / "trial0.json"
     config = _artifact_config(budget=4, weights=2)
@@ -836,6 +847,79 @@ def test_load_traces_reads_each_valid_artifact_once(tmp_path, monkeypatch):
         "Composite qLogEHVI",
     }
     assert set(reads.values()) == {1}
+
+
+def test_load_traces_pairs_matching_foreign_provenance_only(tmp_path):
+    config = _artifact_config()
+    foreign = {
+        "python": "3.12.9",
+        "packages": {
+            "numpy": "2.3.3",
+            "torch": "2.12.0",
+            "botorch": "0.18.0",
+            "gpytorch": "1.15.2",
+            "matplotlib": "3.10.8",
+        },
+        "git_commit": "cluster-commit",
+    }
+    direct = _method_artifact("standard_qlogehvi", config, metadata=foreign)
+    composite = _method_artifact("composite_qlogehvi", config, metadata=foreign)
+    direct["Y"][0][0] += 1e-13
+    direct["hypervolume"][0] += 1e-13
+    composite["components"][0][0] += 1e-13
+    composite["Y"][0][0] += 1e-13
+    composite["hypervolume"][0] += 1e-13
+    _write_pair_artifact(tmp_path, "standard_qlogehvi", 0, direct)
+    _write_pair_artifact(tmp_path, "composite_qlogehvi", 0, composite)
+
+    paired = benchmark.load_traces(_benchmark_args(tmp_path))
+
+    assert set(paired["zdt1"]) == {
+        "Standard qLogEHVI",
+        "Composite qLogEHVI",
+    }
+
+    composite["metadata"] = {**foreign, "git_commit": "other-commit"}
+    _write_pair_artifact(tmp_path, "composite_qlogehvi", 0, composite)
+
+    assert benchmark.load_traces(_benchmark_args(tmp_path))["zdt1"] == {}
+
+    missing = {**foreign, "git_commit": ""}
+    direct["metadata"] = missing
+    composite["metadata"] = missing
+    _write_pair_artifact(tmp_path, "standard_qlogehvi", 0, direct)
+    _write_pair_artifact(tmp_path, "composite_qlogehvi", 0, composite)
+
+    assert benchmark.load_traces(_benchmark_args(tmp_path))["zdt1"] == {}
+
+    incomplete = deepcopy(foreign)
+    incomplete["packages"].pop("torch")
+    direct["metadata"] = incomplete
+    composite["metadata"] = incomplete
+    _write_pair_artifact(tmp_path, "standard_qlogehvi", 0, direct)
+    _write_pair_artifact(tmp_path, "composite_qlogehvi", 0, composite)
+
+    assert benchmark.load_traces(_benchmark_args(tmp_path))["zdt1"] == {}
+
+
+def test_load_traces_does_not_mix_provenance_across_trials(tmp_path):
+    expected = {}
+    for trial, commit in enumerate(("commit-a", "commit-b")):
+        config = _artifact_config(seed=7 + trial)
+        metadata = {**benchmark._run_metadata(), "git_commit": commit}
+        for method in ("standard_qlogehvi", "composite_qlogehvi"):
+            payload = _method_artifact(method, config, metadata=metadata)
+            _write_pair_artifact(tmp_path, method, trial, payload)
+            if trial == 0:
+                expected[benchmark.METHOD_LABELS[method]] = [
+                    payload["hypervolume"]
+                ]
+
+    traces = benchmark.load_traces(_benchmark_args(tmp_path, trials=2))
+
+    assert set(traces["zdt1"]) == set(expected)
+    for method, values in expected.items():
+        assert np.array_equal(traces["zdt1"][method], values)
 
 
 @pytest.mark.parametrize(

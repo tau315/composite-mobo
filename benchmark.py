@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 import json
 import math
+import os
 import platform
 from pathlib import Path
 import subprocess
@@ -50,6 +51,9 @@ COMPARISONS = {
     "stch": ("objective_gp_stch", "composite_stch"),
 }
 RESULT_TIMING_KEYS = (*TIMING_KEYS, "hypervolume_seconds", "total_seconds")
+PACKAGE_NAMES = ("numpy", "torch", "botorch", "gpytorch", "matplotlib")
+VALIDATION_RTOL = 1e-12
+VALIDATION_ATOL = 1e-12
 SCHEMA_VERSION = 2
 
 
@@ -165,7 +169,11 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def _validated_payload(
-    path: Path, expected: dict, metadata: dict | None = None
+    path: Path,
+    expected: dict,
+    metadata: dict | None = None,
+    *,
+    allow_foreign_metadata: bool = False,
 ) -> dict | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -204,7 +212,9 @@ def _validated_payload(
                 )
             )
 
-        expected_metadata = _run_metadata() if metadata is None else metadata
+        expected_metadata = metadata
+        if not allow_foreign_metadata and expected_metadata is None:
+            expected_metadata = _run_metadata()
         trial = int(path.stem.removeprefix("trial"))
         if not (
             isinstance(payload, dict)
@@ -257,13 +267,19 @@ def _validated_payload(
             and isinstance(payload["metadata"], dict)
             and set(payload["metadata"])
             == {"python", "packages", "git_commit"}
-            and payload["metadata"] == expected_metadata
+            and (
+                allow_foreign_metadata
+                or payload["metadata"] == expected_metadata
+            )
             and isinstance(payload["metadata"]["python"], str)
+            and bool(payload["metadata"]["python"].strip())
             and isinstance(payload["metadata"]["packages"], dict)
+            and set(payload["metadata"]["packages"]) == set(PACKAGE_NAMES)
             and isinstance(payload["metadata"]["git_commit"], str)
+            and bool(payload["metadata"]["git_commit"].strip())
             and all(
-                isinstance(key, str) and (value is None or isinstance(value, str))
-                for key, value in payload["metadata"]["packages"].items()
+                isinstance(value, str) and bool(value.strip())
+                for value in payload["metadata"]["packages"].values()
             )
             and payload["failed"] is None
             and matrix(payload["X"], budget, config["dim"])
@@ -287,14 +303,21 @@ def _validated_payload(
             if not matrix(payload["components"], budget, 1):
                 return None
             components = torch.tensor(payload["components"], dtype=torch.double)
-            if not torch.equal(components, problem.components(X)):
+            if not torch.allclose(
+                components,
+                problem.components(X),
+                rtol=VALIDATION_RTOL,
+                atol=VALIDATION_ATOL,
+            ):
                 return None
             expected_y = problem.compose(components, X)
         else:
             if payload["components"] is not None:
                 return None
             expected_y = problem.evaluate(X)
-        if not torch.equal(Y, expected_y):
+        if not torch.allclose(
+            Y, expected_y, rtol=VALIDATION_RTOL, atol=VALIDATION_ATOL
+        ):
             return None
 
         if stch:
@@ -303,9 +326,11 @@ def _validated_payload(
             )
             if not (
                 matrix(payload["weights"], config["weights"], 2)
-                and torch.equal(
+                and torch.allclose(
                     torch.tensor(payload["weights"], dtype=torch.double),
                     expected_weights,
+                    rtol=VALIDATION_RTOL,
+                    atol=VALIDATION_ATOL,
                 )
                 and isinstance(payload["run_ids"], list)
                 and all(type(value) is int for value in payload["run_ids"])
@@ -318,8 +343,11 @@ def _validated_payload(
             return None
 
         values = np.asarray(payload["hypervolume"], dtype=float)
-        if np.any(np.diff(values) < 0) or not np.array_equal(
-            values, hypervolume_trace(Y, problem.ref_point)
+        if np.any(np.diff(values) < -VALIDATION_ATOL) or not np.allclose(
+            values,
+            hypervolume_trace(Y, problem.ref_point),
+            rtol=VALIDATION_RTOL,
+            atol=VALIDATION_ATOL,
         ):
             return None
         return payload
@@ -382,21 +410,23 @@ def _result_payload(
 
 def _run_metadata() -> dict:
     packages = {}
-    for package in ("numpy", "torch", "botorch", "gpytorch", "matplotlib"):
+    for package in PACKAGE_NAMES:
         try:
             packages[package] = version(package)
         except PackageNotFoundError:
             packages[package] = None
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).parent,
-            check=False,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except OSError:
-        commit = ""
+    commit = os.environ.get("COMPOSITE_MOBO_COMMIT", "").strip()
+    if not commit:
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parent,
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except OSError:
+            commit = ""
     return {
         "python": platform.python_version(),
         "packages": packages,
@@ -425,7 +455,6 @@ def load_traces(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
     selected_methods = (
         tuple(METHOD_LABELS) if selected_method is None else (selected_method,)
     )
-    metadata = _run_metadata()
     traces = {}
     for problem in args.problems:
         records = {method: {} for method in selected_methods}
@@ -433,7 +462,9 @@ def load_traces(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
             for trial in trials:
                 path = args.results_dir / problem / method / f"trial{trial}.json"
                 expected = _job_config(args, problem, trial)
-                payload = _validated_payload(path, expected, metadata)
+                payload = _validated_payload(
+                    path, expected, allow_foreign_metadata=True
+                )
                 if payload is None:
                     continue
                 records[method][trial] = payload
@@ -444,6 +475,7 @@ def load_traces(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                 continue
             paired_trials = sorted(set(records[pair[0]]) & set(records[pair[1]]))
             compatible = []
+            family_metadata = None
             for trial in paired_trials:
                 direct = records[pair[0]][trial]
                 composite = records[pair[1]][trial]
@@ -458,8 +490,13 @@ def load_traces(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                     and direct["weights"] == composite["weights"]
                     and direct["X"][:initial_rows]
                     == composite["X"][:initial_rows]
+                    and (
+                        family_metadata is None
+                        or direct["metadata"] == family_metadata
+                    )
                 ):
                     compatible.append(trial)
+                    family_metadata = direct["metadata"]
             paired_trials = compatible
             if not paired_trials:
                 continue
