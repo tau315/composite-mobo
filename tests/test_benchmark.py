@@ -648,6 +648,25 @@ def test_cli_accepts_zero_based_job_selectors_and_results_dir(
     assert args.summary_only
 
 
+def test_cli_defaults_and_zdt2_job_protocol(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["benchmark.py"])
+
+    args = benchmark.parse_args()
+
+    assert (
+        args.trials,
+        args.initial,
+        args.budget,
+        args.weights,
+        args.temperature,
+        args.seed,
+        args.raw_samples,
+        args.restarts,
+    ) == (20, 5, 40, 2, 0.05, 0, 128, 8)
+    config = benchmark._job_config(args, "zdt2", 0)
+    assert (config["budget"], config["initial"]) == (30, 5)
+
+
 def test_summary_only_reads_disk_without_running_jobs(tmp_path, monkeypatch):
     args = _benchmark_args(tmp_path, summary_only=True)
     traces = {"zdt1": {}}
