@@ -126,9 +126,10 @@ def _tiny_problem_counter():
     calls = {"rows": 0}
     def components(X):
         calls["rows"] += len(X)
-        return X[:, :1]
+        return X[..., :1]
     def compose(C, X):
-        return torch.cat((C.square(), (X[:, 1:2] - 0.5).square()), dim=-1)
+        exact = (X[..., 1:2] - 0.5).square() + torch.zeros_like(C)
+        return torch.cat((C.square(), exact), dim=-1)
     return calls, components, compose
 
 
@@ -323,7 +324,7 @@ def _valid_result(path: Path, expected: dict) -> bool:
     budget = expected["budget"]
     return (
         payload.get("failed") is None
-        and payload.get("config", {}).get("budget") == budget
+        and all(payload.get("config", {}).get(key) == value for key, value in expected.items())
         and len(payload.get("X", [])) == budget
         and len(payload.get("Y", [])) == budget
         and len(payload.get("hypervolume", [])) == budget
@@ -419,8 +420,8 @@ Expected: all tests pass.
 Run:
 
 ```powershell
-python benchmark.py --problems zdt1 --trials 1 --budget 10 --raw-samples 16 --restarts 2 --results-dir smoke-results --output smoke.png
-python benchmark.py --problems zdt1 --trials 1 --budget 10 --raw-samples 16 --restarts 2 --results-dir smoke-results --output smoke.png
+python benchmark.py --problems zdt1 --trials 1 --budget 12 --raw-samples 16 --restarts 2 --results-dir smoke-results --output smoke.png
+python benchmark.py --problems zdt1 --trials 1 --budget 12 --raw-samples 16 --restarts 2 --results-dir smoke-results --output smoke.png
 ```
 
 Expected: first command writes four result JSON files and two PNGs; second reports four skips and regenerates plots from disk.
@@ -430,7 +431,7 @@ Expected: first command writes four result JSON files and two PNGs; second repor
 Run:
 
 ```powershell
-python -c "import json,glob,math; ps=glob.glob('smoke-results/zdt1/*/trial0.json'); assert len(ps)==4; ds=[json.load(open(p)) for p in ps]; assert all(len(d['X'])==10 and d['failed'] is None for d in ds); assert all(all(math.isfinite(v) and v>=0 for v in d['timing'].values()) for d in ds); print('validated',len(ds))"
+python -c "import json,glob,math; ps=glob.glob('smoke-results/zdt1/*/trial0.json'); assert len(ps)==4; ds=[json.load(open(p)) for p in ps]; assert all(len(d['X'])==12 and d['failed'] is None for d in ds); assert all(all(math.isfinite(v) and v>=0 for v in d['timing'].values()) for d in ds); print('validated',len(ds))"
 ```
 
 Expected: `validated 4`.
