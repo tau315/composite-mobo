@@ -11,9 +11,10 @@ maximization convention.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import shutil
 import sys
+from time import perf_counter
 from typing import Callable, Optional
 
 import torch
@@ -27,7 +28,10 @@ from botorch.acquisition.multi_objective.objective import (
 )
 from botorch.acquisition.objective import GenericMCObjective
 from botorch.fit import fit_gpytorch_mll
-from botorch.exceptions.errors import OptimizationGradientError
+from botorch.exceptions.errors import (
+    CandidateGenerationError,
+    OptimizationGradientError,
+)
 from botorch.models import ModelListGP, SingleTaskGP
 from botorch.models.transforms.outcome import Standardize
 from botorch.optim import optimize_acqf
@@ -40,6 +44,30 @@ from gpytorch.mlls import ExactMarginalLogLikelihood, SumMarginalLogLikelihood
 Tensor = torch.Tensor
 Evaluator = Callable[[Tensor], Tensor]
 Composer = Callable[[Tensor, Tensor], Tensor]
+
+TIMING_KEYS = (
+    "initial_design_seconds",
+    "initial_evaluate_seconds",
+    "initial_compose_seconds",
+    "gp_fit_seconds",
+    "acquisition_build_seconds",
+    "acquisition_optimize_seconds",
+    "bo_evaluate_seconds",
+    "bo_compose_seconds",
+    "solver_total_seconds",
+)
+
+
+def _new_timing() -> dict[str, float]:
+    return dict.fromkeys(TIMING_KEYS, 0.0)
+
+
+def _timed(timing, key, fn, *args):
+    started = perf_counter()
+    value = fn(*args)
+    timing[key] += perf_counter() - started
+    return value
+
 
 # BoTorch 0.18 tries to JIT-build an optional fused qLogEHVI kernel. On Windows
 # without the MSVC compiler this produces a long subprocess traceback before
@@ -59,6 +87,8 @@ class SolverResult:
     components: Optional[Tensor] = None
     weights: Optional[Tensor] = None
     run_ids: Optional[Tensor] = None
+    timing: dict[str, float] = field(default_factory=_new_timing)
+    wall_seconds: list[float] = field(default_factory=list)
 
 
 def smooth_tchebycheff(
@@ -122,27 +152,19 @@ def _optimize(acq, d: int, raw_samples: int, num_restarts: int) -> Tensor:
             options={"batch_limit": 5, "maxiter": 200},
         )
         return X.detach()
-    except OptimizationGradientError:
-        # A nonlinear composite map can occasionally make a local acquisition
-        # gradient non-finite. Preserve the BO run by selecting the best finite
-        # acquisition value from a fresh, space-filling Sobol candidate set.
+    except (CandidateGenerationError, OptimizationGradientError):
+        # Preserve the BO run by selecting the best finite acquisition value
+        # from a fresh, space-filling Sobol candidate set.
         candidates = draw_sobol_samples(
             bounds=bounds, n=max(raw_samples * num_restarts, 256), q=1
         )
         with torch.no_grad():
             values = acq(candidates)
-        values = torch.nan_to_num(values, nan=-torch.inf, neginf=-torch.inf)
-        if not torch.isfinite(values).any():
+        finite = torch.isfinite(values)
+        if not finite.any():
             raise RuntimeError("acquisition was non-finite on every fallback candidate")
+        values = torch.where(finite, values, torch.full_like(values, -torch.inf))
         return candidates[values.argmax()].detach()
-
-
-def _check_composition(C: Tensor, X: Tensor, Y: Tensor, compose: Composer) -> None:
-    reconstructed = compose(C, X)
-    if reconstructed.shape != Y.shape or not torch.allclose(
-        reconstructed, Y, atol=1e-7, rtol=1e-5
-    ):
-        raise ValueError("compose(evaluate_components(X), X) must equal evaluate(X)")
 
 
 def standard_mobo(
@@ -158,19 +180,40 @@ def standard_mobo(
 ) -> SolverResult:
     """Independent objective GPs followed by numerically stable sequential qLogEHVI."""
 
+    solver_started = perf_counter()
+    timing = _new_timing()
     torch.manual_seed(seed)
-    X = _sobol(n_init, dim, seed)
-    Y = evaluate(X).double()
+    initial_started = perf_counter()
+    X = _timed(timing, "initial_design_seconds", _sobol, n_init, dim, seed)
+    Y = _timed(timing, "initial_evaluate_seconds", evaluate, X).double()
+    initial_wall = (perf_counter() - initial_started) / len(X)
+    wall_seconds = [initial_wall] * len(X)
     ref_max = -torch.as_tensor(ref_point, dtype=torch.double)
     for _ in range(n_iter):
-        model = _independent_gp(X, -Y)
+        iteration_started = perf_counter()
+        model = _timed(timing, "gp_fit_seconds", _independent_gp, X, -Y)
+        acquisition_started = perf_counter()
         partitioning = NondominatedPartitioning(ref_point=ref_max, Y=-Y)
         acq = qLogExpectedHypervolumeImprovement(
             model=model, ref_point=ref_max.tolist(), partitioning=partitioning
         )
-        x = _optimize(acq, dim, raw_samples, num_restarts)
-        X, Y = torch.cat((X, x)), torch.cat((Y, evaluate(x).double()))
-    return SolverResult(X=X, Y=Y)
+        timing["acquisition_build_seconds"] += (
+            perf_counter() - acquisition_started
+        )
+        x = _timed(
+            timing,
+            "acquisition_optimize_seconds",
+            _optimize,
+            acq,
+            dim,
+            raw_samples,
+            num_restarts,
+        )
+        y = _timed(timing, "bo_evaluate_seconds", evaluate, x).double()
+        X, Y = torch.cat((X, x)), torch.cat((Y, y))
+        wall_seconds.append(perf_counter() - iteration_started)
+    timing["solver_total_seconds"] = perf_counter() - solver_started
+    return SolverResult(X=X, Y=Y, timing=timing, wall_seconds=wall_seconds)
 
 
 def composite_mobo(
@@ -188,27 +231,58 @@ def composite_mobo(
 ) -> SolverResult:
     """Intermediate-node GPs and qLogEHVI on composed samples (MO-BOCF)."""
 
+    solver_started = perf_counter()
+    timing = _new_timing()
     torch.manual_seed(seed)
-    X = _sobol(n_init, dim, seed)
-    C, Y = evaluate_components(X).double(), evaluate(X).double()
-    _check_composition(C, X, Y, compose)
+    initial_started = perf_counter()
+    X = _timed(timing, "initial_design_seconds", _sobol, n_init, dim, seed)
+    C = _timed(
+        timing, "initial_evaluate_seconds", evaluate_components, X
+    ).double()
+    Y = _timed(timing, "initial_compose_seconds", compose, C, X).double()
+    initial_wall = (perf_counter() - initial_started) / len(X)
+    wall_seconds = [initial_wall] * len(X)
     ref_max = -torch.as_tensor(ref_point, dtype=torch.double)
-    objective = GenericMCMultiOutputObjective(
-        lambda samples, X=None: -compose(samples, X)
-    )
     for _ in range(n_iter):
-        model = _independent_gp(X, C)
+        iteration_started = perf_counter()
+        model = _timed(timing, "gp_fit_seconds", _independent_gp, X, C)
+        acquisition_started = perf_counter()
         partitioning = NondominatedPartitioning(ref_point=ref_max, Y=-Y)
+        objective = GenericMCMultiOutputObjective(
+            lambda samples, X=None: -compose(samples, X)
+        )
         acq = qLogExpectedHypervolumeImprovement(
             model=model,
             ref_point=ref_max.tolist(),
             partitioning=partitioning,
             objective=objective,
         )
-        x = _optimize(acq, dim, raw_samples, num_restarts)
-        c, y = evaluate_components(x).double(), evaluate(x).double()
+        timing["acquisition_build_seconds"] += (
+            perf_counter() - acquisition_started
+        )
+        x = _timed(
+            timing,
+            "acquisition_optimize_seconds",
+            _optimize,
+            acq,
+            dim,
+            raw_samples,
+            num_restarts,
+        )
+        c = _timed(
+            timing, "bo_evaluate_seconds", evaluate_components, x
+        ).double()
+        y = _timed(timing, "bo_compose_seconds", compose, c, x).double()
         X, C, Y = torch.cat((X, x)), torch.cat((C, c)), torch.cat((Y, y))
-    return SolverResult(X=X, Y=Y, components=C)
+        wall_seconds.append(perf_counter() - iteration_started)
+    timing["solver_total_seconds"] = perf_counter() - solver_started
+    return SolverResult(
+        X=X,
+        Y=Y,
+        components=C,
+        timing=timing,
+        wall_seconds=wall_seconds,
+    )
 
 
 def _scalarized_runs(
@@ -225,22 +299,35 @@ def _scalarized_runs(
     evaluate_components: Optional[Evaluator] = None,
     compose: Optional[Composer] = None,
 ) -> SolverResult:
-    all_x, all_y, all_c, ids = [], [], [], []
+    solver_started = perf_counter()
+    timing = _new_timing()
+    all_x, all_y, all_c, all_wall = [], [], [], []
     for run_id, weight in enumerate(weights.double()):
         run_seed = seed + 104729 * run_id
         torch.manual_seed(run_seed)
-        X = _sobol(n_init, dim, run_seed)
-        Y = evaluate(X).double()
+        initial_started = perf_counter()
+        X = _timed(
+            timing, "initial_design_seconds", _sobol, n_init, dim, run_seed
+        )
         if evaluate_components is None:
             C = None
+            Y = _timed(timing, "initial_evaluate_seconds", evaluate, X).double()
         else:
-            C = evaluate_components(X).double()
-            _check_composition(C, X, Y, compose)  # type: ignore[arg-type]
+            C = _timed(
+                timing, "initial_evaluate_seconds", evaluate_components, X
+            ).double()
+            Y = _timed(
+                timing, "initial_compose_seconds", compose, C, X
+            ).double()
+        initial_wall = (perf_counter() - initial_started) / len(X)
+        wall_seconds = [initial_wall] * len(X)
         for _ in range(n_iter):
+            iteration_started = perf_counter()
             if C is None:
                 # Paper-style CBO: model f_1,...,f_m directly, then apply the
                 # known STCH map to joint posterior samples inside EI.
-                model = _independent_gp(X, Y)
+                model = _timed(timing, "gp_fit_seconds", _independent_gp, X, Y)
+                acquisition_started = perf_counter()
                 objective = GenericMCObjective(
                     lambda samples, X=None, w=weight: -smooth_tchebycheff(
                         samples, w, ideal, temperature
@@ -251,7 +338,8 @@ def _scalarized_runs(
                     model=model, best_f=observed_utility.max(), objective=objective
                 )
             else:
-                model = _independent_gp(X, C)
+                model = _timed(timing, "gp_fit_seconds", _independent_gp, X, C)
+                acquisition_started = perf_counter()
                 objective = GenericMCObjective(
                     lambda samples, X=None, w=weight: -smooth_tchebycheff(
                         compose(samples, X), w, ideal, temperature  # type: ignore[misc]
@@ -261,22 +349,52 @@ def _scalarized_runs(
                 acq = qLogExpectedImprovement(
                     model=model, best_f=observed_utility.max(), objective=objective
                 )
-            x = _optimize(acq, dim, raw_samples, num_restarts)
-            y = evaluate(x).double()
+            timing["acquisition_build_seconds"] += (
+                perf_counter() - acquisition_started
+            )
+            x = _timed(
+                timing,
+                "acquisition_optimize_seconds",
+                _optimize,
+                acq,
+                dim,
+                raw_samples,
+                num_restarts,
+            )
+            if C is None:
+                y = _timed(timing, "bo_evaluate_seconds", evaluate, x).double()
+            else:
+                c = _timed(
+                    timing, "bo_evaluate_seconds", evaluate_components, x
+                ).double()
+                y = _timed(timing, "bo_compose_seconds", compose, c, x).double()
+                C = torch.cat((C, c))
             X, Y = torch.cat((X, x)), torch.cat((Y, y))
-            if C is not None:
-                C = torch.cat((C, evaluate_components(x).double()))  # type: ignore[misc]
+            wall_seconds.append(perf_counter() - iteration_started)
         all_x.append(X)
         all_y.append(Y)
-        ids.append(torch.full((len(X),), run_id, dtype=torch.long))
+        all_wall.append(wall_seconds)
         if C is not None:
             all_c.append(C)
+
+    def interleave(tensors):
+        trailing = tensors[0].shape[1:]
+        return torch.stack(tensors, dim=1).reshape(-1, *trailing)
+
+    X = interleave(all_x)
+    Y = interleave(all_y)
+    C = interleave(all_c) if all_c else None
+    run_ids = torch.arange(len(weights)).repeat(len(all_x[0]))
+    wall_seconds = torch.tensor(all_wall, dtype=torch.double).T.reshape(-1).tolist()
+    timing["solver_total_seconds"] = perf_counter() - solver_started
     return SolverResult(
-        X=torch.cat(all_x),
-        Y=torch.cat(all_y),
-        components=torch.cat(all_c) if all_c else None,
+        X=X,
+        Y=Y,
+        components=C,
         weights=weights,
-        run_ids=torch.cat(ids),
+        run_ids=run_ids,
+        timing=timing,
+        wall_seconds=wall_seconds,
     )
 
 
