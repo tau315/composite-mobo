@@ -45,15 +45,13 @@ class CompositeProblem:
 
 
 def _zdt(name: str, dim: int = 6) -> CompositeProblem:
-    # Model log(g), an invertible observation transform of the unknown inner
-    # function. Reconstructing with exp guarantees positive posterior samples,
-    # which is essential because the known ZDT outer maps divide by g.
+    # Model a radius whose square reconstructs the valid ZDT domain g >= 1.
     def components(X: Tensor) -> Tensor:
         g = 1.0 + 9.0 * X[..., 1:].mean(dim=-1)
-        return torch.log(g).unsqueeze(-1)
+        return torch.sqrt((g - 1.0).clamp_min(0.0)).unsqueeze(-1)
 
     def compose(C: Tensor, X: Tensor) -> Tensor:
-        g = torch.exp(C[..., 0])
+        g = 1.0 + C[..., 0].square()
         # Expand exact x_1 across MC sample dimensions through broadcasting.
         f1 = X[..., 0] + torch.zeros_like(g)
         ratio = (f1 / g).clamp_min(0.0)
@@ -71,23 +69,26 @@ def _zdt(name: str, dim: int = 6) -> CompositeProblem:
             raise ValueError(name)
         return torch.stack((f1, g * h), dim=-1)
 
+    ideal = torch.tensor(
+        [0.0, -0.7733690123] if name == "zdt3" else [0.0, 0.0],
+        dtype=torch.double,
+    )
     return CompositeProblem(
         name, dim, 2, torch.tensor([1.1, 11.0], dtype=torch.double),
-        torch.zeros(2, dtype=torch.double), components, compose,
+        ideal, components, compose,
     )
 
 
 def _dtlz2(dim: int = 6, objectives: int = 2) -> CompositeProblem:
-    # Only the unknown radial inner function g is modeled. Angular variables are
-    # exact candidate coordinates supplied to the known hyperspherical outer map.
+    # Model sqrt(g); angular variables remain exact candidate coordinates.
     k = dim - objectives + 1
 
     def components(X: Tensor) -> Tensor:
         g = (X[..., -k:] - 0.5).square().sum(dim=-1, keepdim=True)
-        return g
+        return torch.sqrt(g)
 
     def compose(C: Tensor, X: Tensor) -> Tensor:
-        g = C[..., 0]
+        g = C[..., 0].square()
         angles = X[..., : objectives - 1]
         # Give exact angles the posterior sample dimensions of g.
         angles = angles + torch.zeros_like(g).unsqueeze(-1)
