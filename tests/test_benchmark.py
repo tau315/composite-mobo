@@ -1,6 +1,8 @@
 from argparse import Namespace
+from copy import deepcopy
 import json
 import math
+from pathlib import Path
 import sys
 
 from matplotlib.axes import Axes
@@ -28,6 +30,7 @@ def _benchmark_args(tmp_path, **overrides):
         "seed": 7,
         "raw_samples": 4,
         "restarts": 1,
+        "mc_samples": 8,
         "results_dir": tmp_path,
         "summary_only": False,
         "output": tmp_path / "hypervolume.png",
@@ -37,23 +40,21 @@ def _benchmark_args(tmp_path, **overrides):
 
 
 def _fake_solver_result(
-    method="standard_qlogehvi", budget=2, dim=2, weights=1
+    method="standard_qlogehvi", budget=2, dim=2, weights=1,
+    problem_name="zdt1",
 ):
+    problem = benchmark.get_problem(problem_name, dim)
+    X = torch.zeros((budget, dim), dtype=torch.double)
     return solvers.SolverResult(
-        X=torch.zeros((budget, dim), dtype=torch.double),
-        Y=torch.column_stack(
-            (
-                torch.linspace(1.0, 0.0, budget, dtype=torch.double),
-                torch.linspace(0.0, 1.0, budget, dtype=torch.double),
-            )
-        ),
+        X=X,
+        Y=problem.evaluate(X),
         components=(
-            torch.zeros((budget, 1), dtype=torch.double)
+            problem.components(X)
             if method.startswith("composite_")
             else None
         ),
         weights=(
-            torch.full((weights, 2), 0.5, dtype=torch.double)
+            solvers.simplex_weights(weights, 2, seed=7)
             if method.endswith("_stch")
             else None
         ),
@@ -77,6 +78,7 @@ def _artifact_config(**overrides):
         "seed": 7,
         "raw_samples": 4,
         "restarts": 1,
+        "mc_samples": 8,
     }
     config.update(overrides)
     return config
@@ -85,29 +87,32 @@ def _artifact_config(**overrides):
 def _artifact(config=None, **overrides):
     config = config or _artifact_config()
     budget = config["budget"]
+    X = torch.zeros((budget, config["dim"]), dtype=torch.double)
+    X[:, 0] = torch.linspace(0.0, 0.75, budget, dtype=torch.double)
+    problem = benchmark.get_problem("zdt1", config["dim"])
+    Y = problem.evaluate(X)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "problem": "zdt1",
         "method": "standard_qlogehvi",
         "trial": config["seed"] - 7,
         "seed": config["seed"],
         "config": config,
-        "metadata": {
-            "python": "3.12.0",
-            "packages": {"torch": "2.0"},
-            "git_commit": "abc123",
-        },
-        "X": [[float(i), 0.0] for i in range(budget)],
-        "Y": [[float(i), 1.0] for i in range(budget)],
+        "metadata": benchmark._run_metadata(),
+        "X": X.tolist(),
+        "Y": Y.tolist(),
         "components": None,
         "weights": None,
         "run_ids": None,
-        "hypervolume": [float(i) for i in range(budget)],
+        "hypervolume": benchmark.hypervolume_trace(
+            Y, problem.ref_point
+        ).tolist(),
         "wall_seconds": [0.01] * budget,
         "timing": dict.fromkeys(
             (*solvers.TIMING_KEYS, "hypervolume_seconds", "total_seconds"),
             0.0,
         ),
+        "acquisition_fallbacks": 0,
         "failed": None,
     }
     payload.update(overrides)
@@ -119,13 +124,36 @@ def _method_artifact(method, config=None, **overrides):
     budget = config["budget"]
     payload = _artifact(config, method=method)
     if method.startswith("composite_"):
-        payload["components"] = [[float(i)] for i in range(budget)]
+        problem = benchmark.get_problem(payload["problem"], config["dim"])
+        payload["components"] = problem.components(
+            torch.tensor(payload["X"], dtype=torch.double)
+        ).tolist()
     if method.endswith("_stch"):
-        payload["weights"] = [[0.5, 0.5]] * config["weights"]
+        payload["weights"] = solvers.simplex_weights(
+            config["weights"], 2, seed=config["seed"]
+        ).tolist()
         payload["run_ids"] = list(range(config["weights"])) * (
             budget // config["weights"]
         )
     payload.update(overrides)
+    return payload
+
+
+def _set_design(payload, X):
+    """Update every deterministic artifact field after changing its design."""
+
+    problem = benchmark.get_problem(
+        payload["problem"], payload["config"]["dim"]
+    )
+    X = torch.as_tensor(X, dtype=torch.double)
+    Y = problem.evaluate(X)
+    payload["X"] = X.tolist()
+    payload["Y"] = Y.tolist()
+    payload["hypervolume"] = benchmark.hypervolume_trace(
+        Y, problem.ref_point
+    ).tolist()
+    if payload["method"].startswith("composite_"):
+        payload["components"] = problem.components(X).tolist()
     return payload
 
 
@@ -293,8 +321,9 @@ def test_acquisition_fallback_rejects_all_nonfinite_values(monkeypatch):
     )
 
     values = torch.tensor([torch.inf, 1.0, torch.nan], dtype=torch.double)
-    chosen = solvers._optimize(lambda X: values, 2, 2, 2)
+    chosen, fallback = solvers._optimize(lambda X: values, 2, 2, 2)
     assert torch.equal(chosen, candidates[1])
+    assert fallback
 
     with pytest.raises(
         RuntimeError, match="non-finite on every fallback candidate"
@@ -309,6 +338,72 @@ def test_acquisition_fallback_rejects_all_nonfinite_values(monkeypatch):
         )
 
 
+def test_all_acquisitions_use_matched_seeded_mc_samplers_and_count_fallbacks(
+    monkeypatch,
+):
+    qlog_samplers = []
+    qei_samplers = []
+
+    def sampler(sample_shape, seed):
+        return (tuple(sample_shape), seed)
+
+    def qlog_acquisition(**kwargs):
+        qlog_samplers.append(kwargs["sampler"])
+        return object()
+
+    def qei_acquisition(**kwargs):
+        qei_samplers.append(kwargs["sampler"])
+        return object()
+
+    monkeypatch.setattr(solvers, "SobolQMCNormalSampler", sampler)
+    monkeypatch.setattr(solvers, "_independent_gp", lambda X, Y: object())
+    monkeypatch.setattr(
+        solvers, "NondominatedPartitioning", lambda **kwargs: object()
+    )
+    monkeypatch.setattr(
+        solvers, "qLogExpectedHypervolumeImprovement", qlog_acquisition
+    )
+    monkeypatch.setattr(solvers, "qLogExpectedImprovement", qei_acquisition)
+    monkeypatch.setattr(
+        solvers,
+        "_optimize",
+        lambda *args: (torch.full((1, 2), 0.25, dtype=torch.double), True),
+    )
+
+    _, components, compose = _tiny_problem_counter()
+    evaluate = lambda X: compose(components(X), X)
+    ref_point = torch.tensor([2.0, 2.0], dtype=torch.double)
+    weights = torch.tensor(
+        [[0.25, 0.75], [0.75, 0.25]], dtype=torch.double
+    )
+    ideal = torch.zeros(2, dtype=torch.double)
+    qlog_results = (
+        solvers.standard_mobo(
+            evaluate, 2, ref_point, n_init=2, n_iter=2,
+            seed=11, mc_samples=13,
+        ),
+        solvers.composite_mobo(
+            evaluate, components, compose, 2, ref_point,
+            n_init=2, n_iter=2, seed=11, mc_samples=13,
+        ),
+    )
+    stch_results = (
+        solvers.chebyshev_bo(
+            evaluate, 2, weights, ideal, n_init=1, n_iter=1,
+            seed=11, mc_samples=13,
+        ),
+        solvers.composite_chebyshev_bo(
+            evaluate, components, compose, 2, weights, ideal,
+            n_init=1, n_iter=1, seed=11, mc_samples=13,
+        ),
+    )
+
+    assert qlog_samplers == [((13,), 13), ((13,), 14)] * 2
+    assert qei_samplers == [((13,), 12), ((13,), 104741)] * 2
+    assert [result.acquisition_fallbacks for result in qlog_results] == [2, 2]
+    assert [result.acquisition_fallbacks for result in stch_results] == [2, 2]
+
+
 def test_atomic_artifact_and_strict_resume_validation(tmp_path):
     path = tmp_path / "zdt1" / "standard_qlogehvi" / "trial0.json"
     config = _artifact_config()
@@ -317,9 +412,53 @@ def test_atomic_artifact_and_strict_resume_validation(tmp_path):
     benchmark._atomic_write_json(path, payload)
 
     assert json.loads(path.read_text(encoding="utf-8")) == payload
+    assert benchmark._validated_payload(path, config) == payload
     assert benchmark._valid_result(path, config)
     assert not benchmark._valid_result(path, _artifact_config(budget=3))
     assert not benchmark._valid_result(path, _artifact_config(seed=8))
+
+
+@pytest.mark.parametrize("field", ("python", "packages", "git_commit"))
+def test_resume_validation_requires_exact_current_provenance(tmp_path, field):
+    path = tmp_path / "zdt1" / "standard_qlogehvi" / "trial0.json"
+    payload = _artifact()
+    payload["metadata"] = deepcopy(payload["metadata"])
+    payload["metadata"][field] = (
+        {"torch": "stale"} if field == "packages" else "stale"
+    )
+    benchmark._atomic_write_json(path, payload)
+
+    assert not benchmark._valid_result(path, payload["config"])
+
+
+def test_resume_validation_recomputes_problem_outputs_and_hypervolume(tmp_path):
+    path = tmp_path / "zdt1" / "composite_stch" / "trial0.json"
+    config = _artifact_config(budget=4, weights=2)
+    valid = _method_artifact("composite_stch", config)
+    corruptions = []
+
+    payload = deepcopy(valid)
+    payload["X"][0][0] = 1.01
+    corruptions.append(payload)
+    payload = deepcopy(valid)
+    payload["Y"][0][0] += 0.01
+    corruptions.append(payload)
+    payload = deepcopy(valid)
+    payload["components"][0][0] += 0.01
+    corruptions.append(payload)
+    payload = deepcopy(valid)
+    payload["weights"][0] = [0.5, 0.5]
+    corruptions.append(payload)
+    payload = deepcopy(valid)
+    payload["hypervolume"][1] = payload["hypervolume"][0] - 0.01
+    corruptions.append(payload)
+    payload = deepcopy(valid)
+    payload["hypervolume"][-1] += 0.01
+    corruptions.append(payload)
+
+    for payload in corruptions:
+        benchmark._atomic_write_json(path, payload)
+        assert not benchmark._valid_result(path, config)
 
 
 @pytest.mark.parametrize("method", tuple(benchmark.METHOD_LABELS))
@@ -368,7 +507,7 @@ def test_resume_validation_rejects_method_incompatible_results(
     assert not benchmark._valid_result(path, config)
 
 
-@pytest.mark.parametrize("method", tuple(benchmark.METHOD_LABELS))
+@pytest.mark.parametrize("method", ("objective_gp_stch", "composite_stch"))
 def test_resume_validation_rejects_nondivisible_budget(tmp_path, method):
     config = _artifact_config(budget=3, weights=2)
     path = tmp_path / "zdt1" / method / "trial0.json"
@@ -391,6 +530,9 @@ def test_resume_validation_never_raises_and_rejects_malformed_artifacts(tmp_path
         _artifact(config, Y=[[0.0, 1.0], [2.0]]),
         _artifact(config, hypervolume=[0.0, float("nan")]),
         _artifact(config, wall_seconds=[0.01, -0.01]),
+        _artifact(config, acquisition_fallbacks=-1),
+        _artifact(config, acquisition_fallbacks=1.5),
+        _artifact(config, schema_version=1),
         _artifact(
             config,
             timing={"total_seconds": 0.0},
@@ -430,7 +572,9 @@ def test_selected_job_resumes_only_with_the_full_expected_config(
 
     def succeed(*args, **kwargs):
         calls.append("standard_qlogehvi")
-        return _fake_solver_result()
+        result = _fake_solver_result()
+        result.acquisition_fallbacks = 3
+        return result
 
     def unexpected(*args, **kwargs):
         pytest.fail("unselected method ran")
@@ -462,7 +606,9 @@ def test_selected_job_resumes_only_with_the_full_expected_config(
         "seed": 8,
         "raw_samples": 4,
         "restarts": 1,
+        "mc_samples": 8,
     }
+    assert payload["acquisition_fallbacks"] == 3
     assert not (tmp_path / "zdt1" / "standard_qlogehvi" / "trial0.json").exists()
 
     args.raw_samples = 8
@@ -497,7 +643,8 @@ def test_one_job_failure_writes_traceback_and_does_not_abort_siblings(
         benchmark, "composite_chebyshev_bo", succeed("composite_stch")
     )
 
-    benchmark.run(_benchmark_args(tmp_path))
+    with pytest.raises(RuntimeError, match="1 benchmark job failed"):
+        benchmark.run(_benchmark_args(tmp_path))
 
     assert calls == list(benchmark.METHOD_LABELS)
     for method in benchmark.METHOD_LABELS:
@@ -520,7 +667,7 @@ def test_one_job_failure_writes_traceback_and_does_not_abort_siblings(
                 [[0.0], [0.0]] if method.startswith("composite_") else None
             )
             assert payload["weights"] == (
-                [[0.5, 0.5]] if method.endswith("_stch") else None
+                [[0.05, 0.95]] if method.endswith("_stch") else None
             )
             assert payload["run_ids"] == (
                 [0, 0] if method.endswith("_stch") else None
@@ -567,7 +714,8 @@ def test_nonfinite_result_writes_finite_failure_and_continues_siblings(
         solver("composite_stch", _fake_solver_result("composite_stch")),
     )
 
-    benchmark.run(_benchmark_args(tmp_path))
+    with pytest.raises(RuntimeError, match="1 benchmark job failed"):
+        benchmark.run(_benchmark_args(tmp_path))
 
     assert calls == list(benchmark.METHOD_LABELS)
     failed_path = tmp_path / "zdt1" / "standard_qlogehvi" / "trial0.json"
@@ -580,15 +728,52 @@ def test_nonfinite_result_writes_finite_failure_and_continues_siblings(
     assert not benchmark._valid_result(failed_path, payload["config"])
 
 
-def _write_pair_artifact(tmp_path, method, trial, config, values):
+def test_post_solver_failure_preserves_completed_timings(tmp_path, monkeypatch):
+    result = _fake_solver_result(budget=1)
+    result.timing["gp_fit_seconds"] = 1.25
+    result.timing["solver_total_seconds"] = 1.5
+    monkeypatch.setattr(benchmark, "standard_mobo", lambda *args, **kwargs: result)
+
+    args = _benchmark_args(tmp_path, method="standard_qlogehvi")
+    with pytest.raises(RuntimeError, match="1 benchmark job failed"):
+        benchmark.run(args)
+
+    payload = json.loads(
+        (tmp_path / "zdt1" / "standard_qlogehvi" / "trial0.json").read_text()
+    )
+    assert "used 1, expected 2" in payload["failed"]
+    assert payload["timing"]["gp_fit_seconds"] == 1.25
+    assert payload["timing"]["solver_total_seconds"] == 1.5
+    assert payload["timing"]["total_seconds"] > 0
+
+
+def test_qlog_worker_ignores_stch_budget_constraints(tmp_path, monkeypatch):
+    calls = []
+
+    def succeed(*args, **kwargs):
+        calls.append((kwargs["n_init"], kwargs["n_iter"]))
+        return _fake_solver_result(budget=3)
+
+    monkeypatch.setattr(benchmark, "standard_mobo", succeed)
+    args = _benchmark_args(
+        tmp_path,
+        method="standard_qlogehvi",
+        budget=3,
+        initial=2,
+        weights=2,
+    )
+
+    benchmark.run(args)
+
+    assert calls == [(2, 1)]
+    path = tmp_path / "zdt1" / "standard_qlogehvi" / "trial0.json"
+    assert benchmark._valid_result(path, benchmark._job_config(args, "zdt1", 0))
+
+
+def _write_pair_artifact(tmp_path, method, trial, payload):
     benchmark._atomic_write_json(
         tmp_path / "zdt1" / method / f"trial{trial}.json",
-        _method_artifact(
-            method,
-            config,
-            trial=trial,
-            hypervolume=values,
-        ),
+        payload,
     )
 
 
@@ -599,25 +784,91 @@ def test_load_traces_pairs_trials_and_filters_requested_config(tmp_path):
     stale2 = _artifact_config(seed=9, raw_samples=8)
 
     _write_pair_artifact(
-        tmp_path, "standard_qlogehvi", 0, exact0, [0.0, 1.0]
+        tmp_path, "standard_qlogehvi", 0,
+        _method_artifact("standard_qlogehvi", exact0),
+    )
+    direct = _method_artifact("standard_qlogehvi", exact1)
+    composite = _method_artifact("composite_qlogehvi", exact1)
+    _write_pair_artifact(
+        tmp_path, "standard_qlogehvi", 1, direct
     )
     _write_pair_artifact(
-        tmp_path, "standard_qlogehvi", 1, exact1, [1.0, 2.0]
-    )
-    _write_pair_artifact(
-        tmp_path, "composite_qlogehvi", 1, exact1, [3.0, 4.0]
+        tmp_path, "composite_qlogehvi", 1, composite
     )
     for method in ("standard_qlogehvi", "composite_qlogehvi"):
-        _write_pair_artifact(tmp_path, method, 2, stale2, [5.0, 6.0])
+        _write_pair_artifact(
+            tmp_path, method, 2, _method_artifact(method, stale2)
+        )
 
     traces = benchmark.load_traces(requested)
 
     assert np.array_equal(
-        traces["zdt1"]["Standard qLogEHVI"], [[1.0, 2.0]]
+        traces["zdt1"]["Standard qLogEHVI"], [direct["hypervolume"]]
     )
     assert np.array_equal(
-        traces["zdt1"]["Composite qLogEHVI"], [[3.0, 4.0]]
+        traces["zdt1"]["Composite qLogEHVI"],
+        [composite["hypervolume"]],
     )
+
+
+def test_load_traces_reads_each_valid_artifact_once(tmp_path, monkeypatch):
+    config = _artifact_config()
+    for method in ("standard_qlogehvi", "composite_qlogehvi"):
+        _write_pair_artifact(
+            tmp_path, method, 0, _method_artifact(method, config)
+        )
+    reads = {}
+    original = Path.read_text
+
+    def read_once(path, *args, **kwargs):
+        if path.suffix == ".json":
+            reads[path] = reads.get(path, 0) + 1
+            if reads[path] > 1:
+                raise AssertionError(f"reread {path}")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_once)
+
+    traces = benchmark.load_traces(_benchmark_args(tmp_path))
+
+    assert set(traces["zdt1"]) == {
+        "Standard qLogEHVI",
+        "Composite qLogEHVI",
+    }
+    assert set(reads.values()) == {1}
+
+
+@pytest.mark.parametrize(
+    ("pair", "initial_rows"),
+    (("qlogehvi", 1), ("stch", 2)),
+)
+def test_load_traces_requires_family_matched_initial_designs(
+    tmp_path, pair, initial_rows
+):
+    config = _artifact_config(budget=4, initial=1, weights=2)
+    args = _benchmark_args(tmp_path, budget=4, initial=1, weights=2)
+    direct_method, composite_method = benchmark.COMPARISONS[pair]
+    direct = _method_artifact(direct_method, config)
+    composite = _method_artifact(composite_method, config)
+    post_initial = torch.tensor(composite["X"], dtype=torch.double)
+    post_initial[-1, 1] = 0.5
+    _set_design(composite, post_initial)
+    _write_pair_artifact(tmp_path, direct_method, 0, direct)
+    _write_pair_artifact(tmp_path, composite_method, 0, composite)
+
+    paired = benchmark.load_traces(args)
+
+    assert set(paired["zdt1"]) == {
+        benchmark.METHOD_LABELS[direct_method],
+        benchmark.METHOD_LABELS[composite_method],
+    }
+
+    mismatched = torch.tensor(composite["X"], dtype=torch.double)
+    mismatched[initial_rows - 1, 0] += 0.01
+    _set_design(composite, mismatched)
+    _write_pair_artifact(tmp_path, composite_method, 0, composite)
+
+    assert benchmark.load_traces(args)["zdt1"] == {}
 
 
 def test_cli_accepts_zero_based_job_selectors_and_results_dir(
@@ -662,9 +913,12 @@ def test_cli_defaults_and_zdt2_job_protocol(monkeypatch):
         args.seed,
         args.raw_samples,
         args.restarts,
-    ) == (20, 5, 40, 2, 0.05, 0, 128, 8)
+        args.mc_samples,
+    ) == (20, 5, 40, 2, 0.05, 0, 128, 8, 512)
     config = benchmark._job_config(args, "zdt2", 0)
-    assert (config["budget"], config["initial"]) == (30, 5)
+    assert (
+        config["budget"], config["initial"], config["mc_samples"]
+    ) == (30, 5, 512)
 
 
 def test_summary_only_reads_disk_without_running_jobs(tmp_path, monkeypatch):
@@ -733,7 +987,9 @@ def test_zdt2_uses_five_initial_points_and_thirty_total(tmp_path, monkeypatch):
 
     def solver(method):
         def job(*args, **kwargs):
-            calls[method] = (kwargs["n_init"], kwargs["n_iter"])
+            calls[method] = (
+                kwargs["n_init"], kwargs["n_iter"], kwargs["mc_samples"]
+            )
             return _fake_solver_result(method, budget=30, weights=2)
 
         return job
@@ -758,12 +1014,13 @@ def test_zdt2_uses_five_initial_points_and_thirty_total(tmp_path, monkeypatch):
             budget=99,
             initial=5,
             weights=2,
+            mc_samples=17,
         )
     )
 
     assert calls == {
-        "standard_qlogehvi": (5, 25),
-        "composite_qlogehvi": (5, 25),
-        "objective_gp_stch": (5, 10),
-        "composite_stch": (5, 10),
+        "standard_qlogehvi": (5, 25, 17),
+        "composite_qlogehvi": (5, 25, 17),
+        "objective_gp_stch": (5, 10, 17),
+        "composite_stch": (5, 10, 17),
     }

@@ -139,6 +139,7 @@ The default experiment uses:
 - Smooth-Tchebycheff temperature `0.05`
 - Ideal point `(0, 0)`, except ZDT3's `(0, -0.7733690123)`
 - 128 raw acquisition samples and 8 optimization restarts
+- 512 explicitly seeded posterior Monte Carlo samples per acquisition
 
 Every problem uses five initial points per solver run. The total accounting is:
 
@@ -151,7 +152,7 @@ An expensive direct-objective or component evaluation counts once; applying a
 known composition does not add an evaluation. STCH artifacts interleave the two
 weight runs by local evaluation index, so their pooled initial-design boundary
 is 10 evaluations. Corresponding direct and composite methods use matched
-seeds, initial designs, weights, and per-weight seeds.
+seeds, initial designs, weights, per-weight seeds, and posterior-sampler seeds.
 
 For every problem, all methods and trials use the same fixed hypervolume
 reference point:
@@ -164,10 +165,14 @@ Larger dominated hypervolume is better.
 ## Measurements and plots
 
 The benchmark computes cumulative dominated hypervolume after every function
-evaluation. A trial contributes to a comparison only when both methods have a
-valid artifact for the same trial and their full configurations match. Curves
-are the mean across those paired trials; shading is mean plus or minus one
-standard error.
+evaluation. Resume validation requires the exact current Python, package, and
+git provenance; full numeric configuration; path identity; deterministic
+problem outputs, components, weights, and run IDs; and freshly recomputed
+cumulative hypervolume. A trial contributes only when both artifacts also have
+matching provenance and family-appropriate initial designs: five rows for
+qLogEHVI and the first ten interleaved rows for two-weight STCH. Curves are the
+mean across those paired trials; shading is mean plus or minus one standard
+error.
 
 The two controlled comparisons hold the acquisition family fixed:
 
@@ -242,10 +247,12 @@ One job is one `(problem, trial, method)` run and writes one artifact to
 `results/{problem}/{method}/trial{trial}.json`. A worker selected with `--trial`
 or `--method` does not plot. Re-running a command resumes automatically: a
 complete artifact with the exact requested configuration is reported as
-`resumed` and skipped.
+`resumed` and skipped only when its recorded provenance still matches the
+current run.
 
 Failures do not stop sibling jobs. The failed artifact records a traceback in
-`failed`; because failed artifacts are not resume-valid, re-running the same
+`failed`; after all selected siblings finish, the command exits nonzero if any
+job failed. Because failed artifacts are not resume-valid, re-running the same
 command retries them. Writes are atomic.
 
 Regenerate summaries and pairwise plots from valid artifacts without running
@@ -268,6 +275,7 @@ Useful flags include:
 --seed            Base random seed
 --raw-samples     Raw acquisition-optimization samples
 --restarts        Acquisition-optimization restarts
+--mc-samples      Posterior Monte Carlo samples (default: 512)
 --results-dir     Artifact root directory
 --summary-only    Read artifacts and plot without running jobs
 --output          Base output filename used to construct plot names
@@ -279,11 +287,11 @@ five.
 
 ### Artifact fields
 
-Each JSON artifact records the schema version, problem, stable method key,
+Each schema-version-2 JSON artifact records the problem, stable method key,
 trial, seed, full configuration, Python/package/git metadata, evaluated `X`
 and `Y`, optional composite components, optional STCH weights and run IDs,
 cumulative `hypervolume`, per-observation `wall_seconds`, aggregate `timing`,
-and `failed` state.
+the nonnegative integer `acquisition_fallbacks` count, and `failed` state.
 
 For initial points, `wall_seconds` repeats the initial batch time divided by
 the number of points. Each BO entry is that iteration's wall time. STCH values
@@ -305,14 +313,16 @@ are interleaved across weight runs in the same order as `X` and `Y`.
 
 Phase values are accumulated across the whole artifact, including both STCH
 weight runs. They are subsets of the total timers rather than values to add to
-`total_seconds`.
+`total_seconds`. `acquisition_fallbacks` is a diagnostic count, not a duration.
 
 ## Numerical safeguards
 
 The implementation uses double precision and qLogEI/qLogEHVI for stable
 acquisition calculations. If SciPy encounters a non-finite acquisition
 gradient, the solver evaluates the acquisition on a fresh Sobol candidate set
-and selects its best finite candidate.
+and selects its best finite candidate. Each use increments the artifact's
+`acquisition_fallbacks` count; continuous `optimize_acqf` remains the primary
+path.
 
 On Windows without the MSVC compiler, the code skips BoTorch's optional fused
 C++ qLogEHVI extension and uses the equivalent pure-Python implementation.

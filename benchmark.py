@@ -50,6 +50,7 @@ COMPARISONS = {
     "stch": ("objective_gp_stch", "composite_stch"),
 }
 RESULT_TIMING_KEYS = (*TIMING_KEYS, "hypervolume_seconds", "total_seconds")
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -163,17 +164,20 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
-def _valid_result(path: Path, expected: dict) -> bool:
+def _validated_payload(
+    path: Path, expected: dict, metadata: dict | None = None
+) -> dict | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         required = {
             "schema_version", "problem", "method", "trial", "seed", "config",
             "metadata", "X", "Y", "components", "weights", "run_ids",
-            "hypervolume", "wall_seconds", "timing", "failed",
+            "hypervolume", "wall_seconds", "timing", "acquisition_fallbacks",
+            "failed",
         }
         config_keys = {
             "dim", "budget", "initial", "weights", "temperature", "seed",
-            "raw_samples", "restarts",
+            "raw_samples", "restarts", "mc_samples",
         }
 
         def number(value: object) -> bool:
@@ -200,17 +204,13 @@ def _valid_result(path: Path, expected: dict) -> bool:
                 )
             )
 
-        config = payload["config"]
-        metadata = payload["metadata"]
-        timing = payload["timing"]
-        method = payload["method"]
-        budget = expected["budget"]
+        expected_metadata = _run_metadata() if metadata is None else metadata
         trial = int(path.stem.removeprefix("trial"))
-        return (
+        if not (
             isinstance(payload, dict)
             and set(payload) == required
             and type(payload["schema_version"]) is int
-            and payload["schema_version"] == 1
+            and payload["schema_version"] == SCHEMA_VERSION
             and payload["problem"] == path.parent.parent.name
             and payload["method"] == path.parent.name
             and payload["method"] in METHOD_LABELS
@@ -218,59 +218,119 @@ def _valid_result(path: Path, expected: dict) -> bool:
             and payload["trial"] == trial >= 0
             and type(payload["seed"]) is int
             and isinstance(expected, dict)
-            and isinstance(config, dict)
-            and set(config) == set(expected) == config_keys
-            and config == expected
-            and all(type(config[key]) is type(expected[key]) for key in config)
-            and all(number(value) for value in config.values())
+            and isinstance(payload["config"], dict)
+            and set(payload["config"]) == set(expected) == config_keys
+            and payload["config"] == expected
+            and all(
+                type(payload["config"][key]) is type(expected[key])
+                for key in payload["config"]
+            )
+            and all(number(value) for value in payload["config"].values())
+        ):
+            return None
+
+        config = payload["config"]
+        method = payload["method"]
+        budget = config["budget"]
+        timing = payload["timing"]
+        stch = method.endswith("_stch")
+        if not (
+            payload["seed"] == config["seed"]
             and all(
                 type(config[key]) is int and config[key] > 0
                 for key in (
                     "dim", "budget", "initial", "weights", "raw_samples",
-                    "restarts",
+                    "restarts", "mc_samples",
                 )
             )
-            and type(config["seed"]) is int
+            and type(config["seed"]) is int and config["seed"] >= 0
+            and type(config["temperature"]) is float
+            and config["temperature"] > 0
             and budget >= config["initial"]
-            and budget % config["weights"] == 0
-            and payload["seed"] == config["seed"]
-            and isinstance(metadata, dict)
-            and {"python", "packages", "git_commit"} <= metadata.keys()
-            and isinstance(metadata["python"], str)
-            and isinstance(metadata["packages"], dict)
-            and isinstance(metadata["git_commit"], str)
+            and (
+                not stch
+                or (
+                    budget % config["weights"] == 0
+                    and budget // config["weights"] >= config["initial"]
+                )
+            )
+            and isinstance(payload["metadata"], dict)
+            and set(payload["metadata"])
+            == {"python", "packages", "git_commit"}
+            and payload["metadata"] == expected_metadata
+            and isinstance(payload["metadata"]["python"], str)
+            and isinstance(payload["metadata"]["packages"], dict)
+            and isinstance(payload["metadata"]["git_commit"], str)
             and all(
                 isinstance(key, str) and (value is None or isinstance(value, str))
-                for key, value in metadata["packages"].items()
+                for key, value in payload["metadata"]["packages"].items()
             )
             and payload["failed"] is None
             and matrix(payload["X"], budget, config["dim"])
             and matrix(payload["Y"], budget, 2)
-            and (
-                matrix(payload["components"], budget, 1)
-                if method.startswith("composite_")
-                else payload["components"] is None
-            )
-            and (
-                (
-                    matrix(payload["weights"], config["weights"], 2)
-                    and isinstance(payload["run_ids"], list)
-                    and all(type(value) is int for value in payload["run_ids"])
-                    and payload["run_ids"]
-                    == list(range(config["weights"]))
-                    * (budget // config["weights"])
-                )
-                if method.endswith("_stch")
-                else payload["weights"] is None and payload["run_ids"] is None
-            )
-            and vector(payload["hypervolume"], budget)
+            and vector(payload["hypervolume"], budget, nonnegative=True)
             and vector(payload["wall_seconds"], budget, nonnegative=True)
             and isinstance(timing, dict)
-            and set(RESULT_TIMING_KEYS) <= timing.keys()
+            and set(timing) == set(RESULT_TIMING_KEYS)
             and all(number(value) and value >= 0 for value in timing.values())
-        )
+            and type(payload["acquisition_fallbacks"]) is int
+            and payload["acquisition_fallbacks"] >= 0
+        ):
+            return None
+
+        X = torch.tensor(payload["X"], dtype=torch.double)
+        Y = torch.tensor(payload["Y"], dtype=torch.double)
+        if not torch.all((0 <= X) & (X <= 1)):
+            return None
+        problem = get_problem(payload["problem"], config["dim"])
+        if method.startswith("composite_"):
+            if not matrix(payload["components"], budget, 1):
+                return None
+            components = torch.tensor(payload["components"], dtype=torch.double)
+            if not torch.equal(components, problem.components(X)):
+                return None
+            expected_y = problem.compose(components, X)
+        else:
+            if payload["components"] is not None:
+                return None
+            expected_y = problem.evaluate(X)
+        if not torch.equal(Y, expected_y):
+            return None
+
+        if stch:
+            expected_weights = simplex_weights(
+                config["weights"], problem.objectives, seed=config["seed"]
+            )
+            if not (
+                matrix(payload["weights"], config["weights"], 2)
+                and torch.equal(
+                    torch.tensor(payload["weights"], dtype=torch.double),
+                    expected_weights,
+                )
+                and isinstance(payload["run_ids"], list)
+                and all(type(value) is int for value in payload["run_ids"])
+                and payload["run_ids"]
+                == list(range(config["weights"]))
+                * (budget // config["weights"])
+            ):
+                return None
+        elif payload["weights"] is not None or payload["run_ids"] is not None:
+            return None
+
+        values = np.asarray(payload["hypervolume"], dtype=float)
+        if np.any(np.diff(values) < 0) or not np.array_equal(
+            values, hypervolume_trace(Y, problem.ref_point)
+        ):
+            return None
+        return payload
     except Exception:
-        return False
+        return None
+
+
+def _valid_result(
+    path: Path, expected: dict, metadata: dict | None = None
+) -> bool:
+    return _validated_payload(path, expected, metadata) is not None
 
 
 def _result_payload(
@@ -283,34 +343,39 @@ def _result_payload(
     metadata: dict,
     failed: str | None,
 ) -> dict:
+    complete = result is not None and failed is None
+    acquisition_fallbacks = getattr(result, "acquisition_fallbacks", 0)
+    if type(acquisition_fallbacks) is not int or acquisition_fallbacks < 0:
+        acquisition_fallbacks = 0
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "problem": problem_name,
         "method": method,
         "trial": trial,
         "seed": config["seed"],
         "config": config,
         "metadata": metadata,
-        "X": result.X.tolist() if result else [],
-        "Y": result.Y.tolist() if result else [],
+        "X": result.X.tolist() if complete else [],
+        "Y": result.Y.tolist() if complete else [],
         "components": (
             result.components.tolist()
-            if result and result.components is not None
+            if complete and result.components is not None
             else None
         ),
         "weights": (
             result.weights.tolist()
-            if result and result.weights is not None
+            if complete and result.weights is not None
             else None
         ),
         "run_ids": (
             result.run_ids.tolist()
-            if result and result.run_ids is not None
+            if complete and result.run_ids is not None
             else None
         ),
         "hypervolume": hypervolume_values,
-        "wall_seconds": result.wall_seconds if result else [],
+        "wall_seconds": result.wall_seconds if complete else [],
         "timing": dict(result.timing) if result else {},
+        "acquisition_fallbacks": acquisition_fallbacks,
         "failed": failed,
     }
 
@@ -349,6 +414,7 @@ def _job_config(args: argparse.Namespace, problem: str, trial: int) -> dict:
         "seed": args.seed + trial,
         "raw_samples": args.raw_samples,
         "restarts": args.restarts,
+        "mc_samples": args.mc_samples,
     }
 
 
@@ -359,6 +425,7 @@ def load_traces(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
     selected_methods = (
         tuple(METHOD_LABELS) if selected_method is None else (selected_method,)
     )
+    metadata = _run_metadata()
     traces = {}
     for problem in args.problems:
         records = {method: {} for method in selected_methods}
@@ -366,30 +433,42 @@ def load_traces(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
             for trial in trials:
                 path = args.results_dir / problem / method / f"trial{trial}.json"
                 expected = _job_config(args, problem, trial)
-                if not _valid_result(path, expected):
+                payload = _validated_payload(path, expected, metadata)
+                if payload is None:
                     continue
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                    values = np.asarray(payload["hypervolume"], dtype=float)
-                except (OSError, TypeError, ValueError):
-                    continue
-                records[method][trial] = (payload["config"], values)
+                records[method][trial] = payload
 
         methods = {}
-        for pair in COMPARISONS.values():
+        for comparison, pair in COMPARISONS.items():
             if any(method not in records for method in pair):
                 continue
             paired_trials = sorted(set(records[pair[0]]) & set(records[pair[1]]))
-            paired_trials = [
-                trial
-                for trial in paired_trials
-                if records[pair[0]][trial][0] == records[pair[1]][trial][0]
-            ]
+            compatible = []
+            for trial in paired_trials:
+                direct = records[pair[0]][trial]
+                composite = records[pair[1]][trial]
+                initial_rows = direct["config"]["initial"] * (
+                    direct["config"]["weights"]
+                    if comparison == "stch"
+                    else 1
+                )
+                if (
+                    direct["config"] == composite["config"]
+                    and direct["metadata"] == composite["metadata"]
+                    and direct["weights"] == composite["weights"]
+                    and direct["X"][:initial_rows]
+                    == composite["X"][:initial_rows]
+                ):
+                    compatible.append(trial)
+            paired_trials = compatible
             if not paired_trials:
                 continue
             for method in pair:
                 methods[METHOD_LABELS[method]] = np.stack(
-                    [records[method][trial][1] for trial in paired_trials]
+                    [
+                        records[method][trial]["hypervolume"]
+                        for trial in paired_trials
+                    ]
                 )
         traces[problem] = methods
     return traces
@@ -406,7 +485,9 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
     if selected_method is not None and selected_method not in METHOD_LABELS:
         raise ValueError(f"unknown method: {selected_method}")
     methods = tuple(METHOD_LABELS) if selected_method is None else (selected_method,)
+    stch_selected = any(method.endswith("_stch") for method in methods)
     metadata = _run_metadata()
+    failure_count = 0
 
     for problem_name in args.problems:
         base_config = _job_config(args, problem_name, 0)
@@ -414,18 +495,29 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
         initial = base_config["initial"]
         if budget < initial:
             raise ValueError("budget must be at least the number of initial points")
-        if budget % args.weights:
-            raise ValueError("budget must be divisible by weights for equal scalarization runs")
-        scalar_run_budget = budget // args.weights
-        if scalar_run_budget < initial:
-            raise ValueError("budget / weights must be at least the initial-point count")
+        scalar_run_budget = budget
+        if stch_selected:
+            if budget % args.weights:
+                raise ValueError(
+                    "budget must be divisible by weights for equal scalarization runs"
+                )
+            scalar_run_budget = budget // args.weights
+            if scalar_run_budget < initial:
+                raise ValueError(
+                    "budget / weights must be at least the initial-point count"
+                )
         problem = get_problem(problem_name, args.dim)
         for trial in trials:
             seed = args.seed + trial
-            weights = simplex_weights(args.weights, problem.objectives, seed=seed)
+            weights = (
+                simplex_weights(args.weights, problem.objectives, seed=seed)
+                if stch_selected
+                else None
+            )
             common = dict(
                 seed=seed, raw_samples=args.raw_samples,
                 num_restarts=args.restarts,
+                mc_samples=args.mc_samples,
             )
             config = _job_config(args, problem_name, trial)
             jobs = {
@@ -457,7 +549,7 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                     / method
                     / f"trial{trial}.json"
                 )
-                if _valid_result(path, config):
+                if _validated_payload(path, config, metadata) is not None:
                     print(
                         f"{problem.name:6s} trial={trial:02d} "
                         f"{METHOD_LABELS[method]:20s} resumed"
@@ -499,14 +591,24 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                     _atomic_write_json(path, payload)
                 except Exception:
                     failed = traceback.format_exc()
-                    timing = dict.fromkeys(RESULT_TIMING_KEYS, 0.0)
+                    clean_timing = {}
+                    for key in RESULT_TIMING_KEYS:
+                        value = timing.get(key, 0.0)
+                        clean_timing[key] = (
+                            float(value)
+                            if type(value) in (int, float)
+                            and math.isfinite(value)
+                            and value >= 0
+                            else 0.0
+                        )
+                    timing = clean_timing
                     timing["total_seconds"] = perf_counter() - started
                     payload = _result_payload(
                         problem.name,
                         method,
                         trial,
                         config,
-                        None,
+                        result,
                         [],
                         metadata,
                         failed,
@@ -521,6 +623,7 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                         )
 
                 if failed is not None:
+                    failure_count += 1
                     print(
                         f"{problem.name:6s} trial={trial:02d} "
                         f"{METHOD_LABELS[method]:20s} FAILED"
@@ -532,6 +635,9 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                     f"HV={hypervolume_values[-1]:.6f} "
                     f"time={timing['total_seconds']:.1f}s"
                 )
+    if failure_count:
+        noun = "job" if failure_count == 1 else "jobs"
+        raise RuntimeError(f"{failure_count} benchmark {noun} failed")
     return load_traces(args)
 
 
@@ -604,6 +710,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--raw-samples", type=int, default=128)
     p.add_argument("--restarts", type=int, default=8)
+    p.add_argument("--mc-samples", type=int, default=512)
     p.add_argument("--results-dir", type=Path, default=Path("results"))
     p.add_argument("--summary-only", action="store_true")
     p.add_argument("--output", type=Path, default=Path("hypervolume_vs_evaluations.png"))

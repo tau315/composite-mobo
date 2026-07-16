@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Preserve four existing method families, problem formulas, total budgets, and matched seeds.
-- Default trials remain 20; ZDT1/ZDT3/DTLZ2 use five initial and 40 total evaluations; ZDT2 uses three initial and 30 total evaluations.
+- Default trials remain 20; ZDT1/ZDT3/DTLZ2 use five initial and 40 total evaluations; ZDT2 uses five initial and 30 total evaluations.
 - Count one component-oracle call per composite observation.
 - Use continuous BoTorch acquisition optimization; no internal multiprocessing framework.
 - Primary comparisons are direct versus composite within qLogEHVI and STCH families.
@@ -369,7 +369,7 @@ p.add_argument("--summary-only", action="store_true")
 
 - [ ] **Step 6: Correct STCH initial markers**
 
-In `plot_results`, use `initial` for qLogEHVI pairs and `initial * weights` for STCH pairs; retain ZDT2's three-point base initial count.
+In `plot_results`, use `initial` for qLogEHVI pairs and `initial * weights` for STCH pairs; use the same five-point base initial count for ZDT2.
 
 - [ ] **Step 7: Run tests**
 

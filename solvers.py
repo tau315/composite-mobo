@@ -35,6 +35,7 @@ from botorch.exceptions.errors import (
 from botorch.models import ModelListGP, SingleTaskGP
 from botorch.models.transforms.outcome import Standardize
 from botorch.optim import optimize_acqf
+from botorch.sampling.normal import SobolQMCNormalSampler
 from botorch.utils.sampling import draw_sobol_samples
 from botorch.utils.multi_objective.box_decompositions.non_dominated import (
     NondominatedPartitioning,
@@ -87,6 +88,7 @@ class SolverResult:
     components: Optional[Tensor] = None
     weights: Optional[Tensor] = None
     run_ids: Optional[Tensor] = None
+    acquisition_fallbacks: int = 0
     timing: dict[str, float] = field(default_factory=_new_timing)
     wall_seconds: list[float] = field(default_factory=list)
 
@@ -140,7 +142,9 @@ def _independent_gp(X: Tensor, Y: Tensor) -> ModelListGP:
     return model
 
 
-def _optimize(acq, d: int, raw_samples: int, num_restarts: int) -> Tensor:
+def _optimize(
+    acq, d: int, raw_samples: int, num_restarts: int
+) -> tuple[Tensor, bool]:
     bounds = torch.stack((torch.zeros(d), torch.ones(d))).double()
     try:
         X, _ = optimize_acqf(
@@ -151,7 +155,7 @@ def _optimize(acq, d: int, raw_samples: int, num_restarts: int) -> Tensor:
             raw_samples=raw_samples,
             options={"batch_limit": 5, "maxiter": 200},
         )
-        return X.detach()
+        return X.detach(), False
     except (CandidateGenerationError, OptimizationGradientError):
         # Preserve the BO run by selecting the best finite acquisition value
         # from a fresh, space-filling Sobol candidate set.
@@ -164,7 +168,7 @@ def _optimize(acq, d: int, raw_samples: int, num_restarts: int) -> Tensor:
         if not finite.any():
             raise RuntimeError("acquisition was non-finite on every fallback candidate")
         values = torch.where(finite, values, torch.full_like(values, -torch.inf))
-        return candidates[values.argmax()].detach()
+        return candidates[values.argmax()].detach(), True
 
 
 def standard_mobo(
@@ -177,6 +181,7 @@ def standard_mobo(
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
+    mc_samples: int = 512,
 ) -> SolverResult:
     """Independent objective GPs followed by numerically stable sequential qLogEHVI."""
 
@@ -188,6 +193,7 @@ def standard_mobo(
     Y = _timed(timing, "initial_evaluate_seconds", evaluate, X).double()
     initial_wall = (perf_counter() - initial_started) / len(X)
     wall_seconds = [initial_wall] * len(X)
+    acquisition_fallbacks = 0
     ref_max = -torch.as_tensor(ref_point, dtype=torch.double)
     for _ in range(n_iter):
         iteration_started = perf_counter()
@@ -195,12 +201,17 @@ def standard_mobo(
         acquisition_started = perf_counter()
         partitioning = NondominatedPartitioning(ref_point=ref_max, Y=-Y)
         acq = qLogExpectedHypervolumeImprovement(
-            model=model, ref_point=ref_max.tolist(), partitioning=partitioning
+            model=model,
+            ref_point=ref_max.tolist(),
+            partitioning=partitioning,
+            sampler=SobolQMCNormalSampler(
+                torch.Size([mc_samples]), seed=seed + len(X)
+            ),
         )
         timing["acquisition_build_seconds"] += (
             perf_counter() - acquisition_started
         )
-        x = _timed(
+        (x, used_fallback) = _timed(
             timing,
             "acquisition_optimize_seconds",
             _optimize,
@@ -209,11 +220,18 @@ def standard_mobo(
             raw_samples,
             num_restarts,
         )
+        acquisition_fallbacks += int(used_fallback)
         y = _timed(timing, "bo_evaluate_seconds", evaluate, x).double()
         X, Y = torch.cat((X, x)), torch.cat((Y, y))
         wall_seconds.append(perf_counter() - iteration_started)
     timing["solver_total_seconds"] = perf_counter() - solver_started
-    return SolverResult(X=X, Y=Y, timing=timing, wall_seconds=wall_seconds)
+    return SolverResult(
+        X=X,
+        Y=Y,
+        acquisition_fallbacks=acquisition_fallbacks,
+        timing=timing,
+        wall_seconds=wall_seconds,
+    )
 
 
 def composite_mobo(
@@ -228,6 +246,7 @@ def composite_mobo(
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
+    mc_samples: int = 512,
 ) -> SolverResult:
     """Intermediate-node GPs and qLogEHVI on composed samples (MO-BOCF)."""
 
@@ -242,6 +261,7 @@ def composite_mobo(
     Y = _timed(timing, "initial_compose_seconds", compose, C, X).double()
     initial_wall = (perf_counter() - initial_started) / len(X)
     wall_seconds = [initial_wall] * len(X)
+    acquisition_fallbacks = 0
     ref_max = -torch.as_tensor(ref_point, dtype=torch.double)
     for _ in range(n_iter):
         iteration_started = perf_counter()
@@ -256,11 +276,14 @@ def composite_mobo(
             ref_point=ref_max.tolist(),
             partitioning=partitioning,
             objective=objective,
+            sampler=SobolQMCNormalSampler(
+                torch.Size([mc_samples]), seed=seed + len(X)
+            ),
         )
         timing["acquisition_build_seconds"] += (
             perf_counter() - acquisition_started
         )
-        x = _timed(
+        (x, used_fallback) = _timed(
             timing,
             "acquisition_optimize_seconds",
             _optimize,
@@ -269,6 +292,7 @@ def composite_mobo(
             raw_samples,
             num_restarts,
         )
+        acquisition_fallbacks += int(used_fallback)
         c = _timed(
             timing, "bo_evaluate_seconds", evaluate_components, x
         ).double()
@@ -280,6 +304,7 @@ def composite_mobo(
         X=X,
         Y=Y,
         components=C,
+        acquisition_fallbacks=acquisition_fallbacks,
         timing=timing,
         wall_seconds=wall_seconds,
     )
@@ -296,11 +321,13 @@ def _scalarized_runs(
     seed: int,
     raw_samples: int,
     num_restarts: int,
+    mc_samples: int,
     evaluate_components: Optional[Evaluator] = None,
     compose: Optional[Composer] = None,
 ) -> SolverResult:
     solver_started = perf_counter()
     timing = _new_timing()
+    acquisition_fallbacks = 0
     all_x, all_y, all_c, all_wall = [], [], [], []
     for run_id, weight in enumerate(weights.double()):
         run_seed = seed + 104729 * run_id
@@ -335,7 +362,12 @@ def _scalarized_runs(
                 )
                 observed_utility = -smooth_tchebycheff(Y, weight, ideal, temperature)
                 acq = qLogExpectedImprovement(
-                    model=model, best_f=observed_utility.max(), objective=objective
+                    model=model,
+                    best_f=observed_utility.max(),
+                    objective=objective,
+                    sampler=SobolQMCNormalSampler(
+                        torch.Size([mc_samples]), seed=run_seed + len(X)
+                    ),
                 )
             else:
                 model = _timed(timing, "gp_fit_seconds", _independent_gp, X, C)
@@ -347,12 +379,17 @@ def _scalarized_runs(
                 )
                 observed_utility = -smooth_tchebycheff(Y, weight, ideal, temperature)
                 acq = qLogExpectedImprovement(
-                    model=model, best_f=observed_utility.max(), objective=objective
+                    model=model,
+                    best_f=observed_utility.max(),
+                    objective=objective,
+                    sampler=SobolQMCNormalSampler(
+                        torch.Size([mc_samples]), seed=run_seed + len(X)
+                    ),
                 )
             timing["acquisition_build_seconds"] += (
                 perf_counter() - acquisition_started
             )
-            x = _timed(
+            (x, used_fallback) = _timed(
                 timing,
                 "acquisition_optimize_seconds",
                 _optimize,
@@ -361,6 +398,7 @@ def _scalarized_runs(
                 raw_samples,
                 num_restarts,
             )
+            acquisition_fallbacks += int(used_fallback)
             if C is None:
                 y = _timed(timing, "bo_evaluate_seconds", evaluate, x).double()
             else:
@@ -393,6 +431,7 @@ def _scalarized_runs(
         components=C,
         weights=weights,
         run_ids=run_ids,
+        acquisition_fallbacks=acquisition_fallbacks,
         timing=timing,
         wall_seconds=wall_seconds,
     )
@@ -410,12 +449,13 @@ def chebyshev_bo(
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
+    mc_samples: int = 512,
 ) -> SolverResult:
     """Objective GPs and EI through STCH posterior samples, one run per weight."""
 
     return _scalarized_runs(
         evaluate, dim, weights, ideal.double(), temperature, n_init, n_iter,
-        seed, raw_samples, num_restarts,
+        seed, raw_samples, num_restarts, mc_samples,
     )
 
 
@@ -433,10 +473,12 @@ def composite_chebyshev_bo(
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
+    mc_samples: int = 512,
 ) -> SolverResult:
     """Node GPs and EI on the double-composed smooth-Tchebycheff posterior."""
 
     return _scalarized_runs(
         evaluate, dim, weights, ideal.double(), temperature, n_init, n_iter,
-        seed, raw_samples, num_restarts, evaluate_components, compose,
+        seed, raw_samples, num_restarts, mc_samples, evaluate_components,
+        compose,
     )
