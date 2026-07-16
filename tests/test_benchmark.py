@@ -336,6 +336,7 @@ def test_resume_validation_accepts_method_result_shapes(tmp_path, method):
     (
         ("standard_qlogehvi", {"Y": [[0.0, 1.0, 2.0]] * 4}),
         ("composite_qlogehvi", {"components": None}),
+        ("composite_qlogehvi", {"components": [[0.0, 1.0]] * 4}),
         ("composite_stch", {"components": [[0.0]] * 3}),
         (
             "composite_qlogehvi",

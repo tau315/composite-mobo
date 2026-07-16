@@ -247,7 +247,7 @@ def _valid_result(path: Path, expected: dict) -> bool:
             and matrix(payload["X"], budget, config["dim"])
             and matrix(payload["Y"], budget, 2)
             and (
-                matrix(payload["components"], budget)
+                matrix(payload["components"], budget, 1)
                 if method.startswith("composite_")
                 else payload["components"] is None
             )
