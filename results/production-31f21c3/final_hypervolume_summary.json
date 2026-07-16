@@ -1,0 +1,197 @@
+{
+  "higher_is_better": true,
+  "problems": {
+    "dtlz2": {
+      "methods": {
+        "Composite STCH": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 5.253065384544282,
+          "sem_final_hypervolume": 0.005317884422628901,
+          "std_final_hypervolume": 0.02378230213097089,
+          "trials": 20
+        },
+        "Composite qLogEHVI": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 5.4386372482446985,
+          "sem_final_hypervolume": 0.0012193594868019546,
+          "std_final_hypervolume": 0.005453141402996856,
+          "trials": 20
+        },
+        "Objective-GP STCH": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 4.9706362305250575,
+          "sem_final_hypervolume": 0.04364767836758327,
+          "std_final_hypervolume": 0.1951983517799265,
+          "trials": 20
+        },
+        "Standard qLogEHVI": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 4.897451136717146,
+          "sem_final_hypervolume": 0.05859625216754652,
+          "std_final_hypervolume": 0.2620504061467068,
+          "trials": 20
+        }
+      },
+      "paired_deltas": {
+        "qlogehvi": {
+          "composite_wins": 20,
+          "mean_composite_minus_direct": 0.5411861115275538,
+          "sem": 0.05822092544714315,
+          "ties": 0,
+          "trials": 20
+        },
+        "stch": {
+          "composite_wins": 20,
+          "mean_composite_minus_direct": 0.28242915401922397,
+          "sem": 0.042763673233297946,
+          "ties": 0,
+          "trials": 20
+        }
+      }
+    },
+    "zdt1": {
+      "methods": {
+        "Composite STCH": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 11.175506074314097,
+          "sem_final_hypervolume": 0.01349290303730685,
+          "std_final_hypervolume": 0.060342096810463,
+          "trials": 20
+        },
+        "Composite qLogEHVI": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 11.743089409998245,
+          "sem_final_hypervolume": 0.0014910981520909934,
+          "std_final_hypervolume": 0.006668393658399563,
+          "trials": 20
+        },
+        "Objective-GP STCH": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 11.312338438172686,
+          "sem_final_hypervolume": 0.03439924370043299,
+          "std_final_hypervolume": 0.15383809457749917,
+          "trials": 20
+        },
+        "Standard qLogEHVI": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 11.574362660251618,
+          "sem_final_hypervolume": 0.00785322188079353,
+          "std_final_hypervolume": 0.03512067593568617,
+          "trials": 20
+        }
+      },
+      "paired_deltas": {
+        "qlogehvi": {
+          "composite_wins": 20,
+          "mean_composite_minus_direct": 0.1687267497466256,
+          "sem": 0.008120755017929426,
+          "ties": 0,
+          "trials": 20
+        },
+        "stch": {
+          "composite_wins": 5,
+          "mean_composite_minus_direct": -0.13683236385859124,
+          "sem": 0.03524610147249014,
+          "ties": 1,
+          "trials": 20
+        }
+      }
+    },
+    "zdt2": {
+      "methods": {
+        "Composite STCH": {
+          "evaluations": 30,
+          "mean_final_hypervolume": 11.099999999999998,
+          "sem_final_hypervolume": 4.07524207927e-16,
+          "std_final_hypervolume": 1.8225036628030615e-15,
+          "trials": 20
+        },
+        "Composite qLogEHVI": {
+          "evaluations": 30,
+          "mean_final_hypervolume": 11.405618970164893,
+          "sem_final_hypervolume": 0.0017743061301013156,
+          "std_final_hypervolume": 0.007934938239602255,
+          "trials": 20
+        },
+        "Objective-GP STCH": {
+          "evaluations": 30,
+          "mean_final_hypervolume": 11.1333467509913,
+          "sem_final_hypervolume": 0.009574243355733349,
+          "std_final_hypervolume": 0.04281731795309094,
+          "trials": 20
+        },
+        "Standard qLogEHVI": {
+          "evaluations": 30,
+          "mean_final_hypervolume": 11.027775568364886,
+          "sem_final_hypervolume": 0.012789147076802223,
+          "std_final_hypervolume": 0.057194804475944994,
+          "trials": 20
+        }
+      },
+      "paired_deltas": {
+        "qlogehvi": {
+          "composite_wins": 20,
+          "mean_composite_minus_direct": 0.377843401800006,
+          "sem": 0.01322850471924739,
+          "ties": 0,
+          "trials": 20
+        },
+        "stch": {
+          "composite_wins": 0,
+          "mean_composite_minus_direct": -0.033346750991301556,
+          "sem": 0.00957424335573335,
+          "ties": 8,
+          "trials": 20
+        }
+      }
+    },
+    "zdt3": {
+      "methods": {
+        "Composite STCH": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 11.895440140651692,
+          "sem_final_hypervolume": 0.0389549637159603,
+          "std_final_hypervolume": 0.1742118938598501,
+          "trials": 20
+        },
+        "Composite qLogEHVI": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 12.206682250844064,
+          "sem_final_hypervolume": 0.0013855080743203792,
+          "std_final_hypervolume": 0.006196180475110397,
+          "trials": 20
+        },
+        "Objective-GP STCH": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 11.34161761227829,
+          "sem_final_hypervolume": 0.046780962544893404,
+          "std_final_hypervolume": 0.20921082460650642,
+          "trials": 20
+        },
+        "Standard qLogEHVI": {
+          "evaluations": 40,
+          "mean_final_hypervolume": 11.663722064917057,
+          "sem_final_hypervolume": 0.039458301273995716,
+          "std_final_hypervolume": 0.17646288785064196,
+          "trials": 20
+        }
+      },
+      "paired_deltas": {
+        "qlogehvi": {
+          "composite_wins": 20,
+          "mean_composite_minus_direct": 0.5429601859270111,
+          "sem": 0.039604154779703284,
+          "ties": 0,
+          "trials": 20
+        },
+        "stch": {
+          "composite_wins": 19,
+          "mean_composite_minus_direct": 0.5538225283734037,
+          "sem": 0.06625263227566687,
+          "ties": 0,
+          "trials": 20
+        }
+      }
+    }
+  }
+}

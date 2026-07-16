@@ -1,0 +1,33 @@
+{
+  "acquisition_fallbacks": {
+    "artifacts": 0,
+    "total": 0
+  },
+  "artifacts": 320,
+  "failed_artifacts": 0,
+  "method_total_seconds": {
+    "composite_qlogehvi": 9502.928781700004,
+    "composite_stch": 2230.7127836000072,
+    "objective_gp_stch": 2892.3806092999966,
+    "standard_qlogehvi": 6698.698728200003
+  },
+  "paired_trials_per_family": {
+    "dtlz2": 20,
+    "zdt1": 20,
+    "zdt2": 20,
+    "zdt3": 20
+  },
+  "timing_totals_seconds": {
+    "acquisition_build_seconds": 7.434390799910034,
+    "acquisition_optimize_seconds": 15609.894185600004,
+    "bo_compose_seconds": 0.537186300047324,
+    "bo_evaluate_seconds": 1.3399955999520898,
+    "gp_fit_seconds": 5695.241109600007,
+    "hypervolume_seconds": 8.127848499996617,
+    "initial_compose_seconds": 0.04879640000581276,
+    "initial_design_seconds": 0.5466923999865685,
+    "initial_evaluate_seconds": 0.3613638000078936,
+    "solver_total_seconds": 21316.575100800022,
+    "total_seconds": 21324.72090280001
+  }
+}
