@@ -10,6 +10,7 @@ import argparse
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 import json
+import math
 import platform
 from pathlib import Path
 import subprocess
@@ -17,6 +18,9 @@ from time import perf_counter
 import traceback
 from typing import Callable
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -41,6 +45,11 @@ METHOD_LABELS = {
     "objective_gp_stch": "Objective-GP STCH",
     "composite_stch": "Composite STCH",
 }
+COMPARISONS = {
+    "qlogehvi": ("standard_qlogehvi", "composite_qlogehvi"),
+    "stch": ("objective_gp_stch", "composite_stch"),
+}
+RESULT_TIMING_KEYS = (*TIMING_KEYS, "hypervolume_seconds", "total_seconds")
 
 
 @dataclass(frozen=True)
@@ -157,16 +166,115 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 def _valid_result(path: Path, expected: dict) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        required = {
+            "schema_version", "problem", "method", "trial", "seed", "config",
+            "metadata", "X", "Y", "components", "weights", "run_ids",
+            "hypervolume", "wall_seconds", "timing", "failed",
+        }
+        config_keys = {
+            "dim", "budget", "initial", "weights", "temperature", "seed",
+            "raw_samples", "restarts",
+        }
+
+        def number(value: object) -> bool:
+            return type(value) in (int, float) and math.isfinite(value)
+
+        def vector(values: object, length: int, nonnegative: bool = False) -> bool:
+            return (
+                isinstance(values, list)
+                and len(values) == length
+                and all(number(value) and (not nonnegative or value >= 0) for value in values)
+            )
+
+        def matrix(values: object, rows: int, columns: int | None = None) -> bool:
+            return (
+                isinstance(values, list)
+                and len(values) == rows
+                and rows > 0
+                and all(isinstance(row, list) for row in values)
+                and (width := len(values[0])) > 0
+                and (columns is None or width == columns)
+                and all(
+                    len(row) == width and all(number(value) for value in row)
+                    for row in values
+                )
+            )
+
+        config = payload["config"]
+        metadata = payload["metadata"]
+        timing = payload["timing"]
+        budget = expected["budget"]
+        trial = int(path.stem.removeprefix("trial"))
+        return (
+            isinstance(payload, dict)
+            and set(payload) == required
+            and type(payload["schema_version"]) is int
+            and payload["schema_version"] == 1
+            and payload["problem"] == path.parent.parent.name
+            and payload["method"] == path.parent.name
+            and payload["method"] in METHOD_LABELS
+            and type(payload["trial"]) is int
+            and payload["trial"] == trial >= 0
+            and type(payload["seed"]) is int
+            and isinstance(expected, dict)
+            and isinstance(config, dict)
+            and set(config) == set(expected) == config_keys
+            and config == expected
+            and all(type(config[key]) is type(expected[key]) for key in config)
+            and all(number(value) for value in config.values())
+            and all(
+                type(config[key]) is int and config[key] > 0
+                for key in (
+                    "dim", "budget", "initial", "weights", "raw_samples",
+                    "restarts",
+                )
+            )
+            and type(config["seed"]) is int
+            and budget >= config["initial"]
+            and payload["seed"] == config["seed"]
+            and isinstance(metadata, dict)
+            and {"python", "packages", "git_commit"} <= metadata.keys()
+            and isinstance(metadata["python"], str)
+            and isinstance(metadata["packages"], dict)
+            and isinstance(metadata["git_commit"], str)
+            and all(
+                isinstance(key, str) and (value is None or isinstance(value, str))
+                for key, value in metadata["packages"].items()
+            )
+            and payload["failed"] is None
+            and matrix(payload["X"], budget, config["dim"])
+            and matrix(payload["Y"], budget)
+            and (
+                payload["components"] is None
+                or matrix(payload["components"], budget)
+            )
+            and (
+                payload["weights"] is None
+                or matrix(
+                    payload["weights"],
+                    len(payload["weights"]),
+                    len(payload["Y"][0]),
+                )
+            )
+            and (
+                payload["run_ids"] is None
+                or (
+                    isinstance(payload["run_ids"], list)
+                    and len(payload["run_ids"]) == budget
+                    and all(
+                        type(value) is int and value >= 0
+                        for value in payload["run_ids"]
+                    )
+                )
+            )
+            and vector(payload["hypervolume"], budget)
+            and vector(payload["wall_seconds"], budget, nonnegative=True)
+            and isinstance(timing, dict)
+            and set(RESULT_TIMING_KEYS) <= timing.keys()
+            and all(number(value) and value >= 0 for value in timing.values())
+        )
+    except Exception:
         return False
-    budget = expected.get("budget")
-    series = (payload.get("X"), payload.get("Y"), payload.get("hypervolume"))
-    return (
-        isinstance(budget, int)
-        and payload.get("failed") is None
-        and payload.get("config") == expected
-        and all(isinstance(values, list) and len(values) == budget for values in series)
-    )
 
 
 def _result_payload(
@@ -235,31 +343,58 @@ def _run_metadata() -> dict:
     }
 
 
-def load_traces(
-    results_dir: Path, problems: list[str]
-) -> dict[str, dict[str, np.ndarray]]:
+def _job_config(args: argparse.Namespace, problem: str, trial: int) -> dict:
+    return {
+        "dim": args.dim,
+        "budget": 30 if problem == "zdt2" else args.budget,
+        "initial": args.initial,
+        "weights": args.weights,
+        "temperature": args.temperature,
+        "seed": args.seed + trial,
+        "raw_samples": args.raw_samples,
+        "restarts": args.restarts,
+    }
+
+
+def load_traces(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
+    selected_trial = getattr(args, "trial", None)
+    trials = range(args.trials) if selected_trial is None else (selected_trial,)
+    selected_method = getattr(args, "method", None)
+    selected_methods = (
+        tuple(METHOD_LABELS) if selected_method is None else (selected_method,)
+    )
     traces = {}
-    for problem in problems:
-        methods = {}
-        for method, label in METHOD_LABELS.items():
-            values = []
-            for path in (results_dir / problem / method).glob("trial*.json"):
+    for problem in args.problems:
+        records = {method: {} for method in selected_methods}
+        for method in selected_methods:
+            for trial in trials:
+                path = args.results_dir / problem / method / f"trial{trial}.json"
+                expected = _job_config(args, problem, trial)
+                if not _valid_result(path, expected):
+                    continue
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
+                    values = np.asarray(payload["hypervolume"], dtype=float)
+                except (OSError, TypeError, ValueError):
                     continue
-                config = payload.get("config")
-                if not isinstance(config, dict) or not _valid_result(path, config):
-                    continue
-                values.append(
-                    (
-                        payload.get("trial", 0),
-                        np.asarray(payload["hypervolume"], dtype=float),
-                    )
+                records[method][trial] = (payload["config"], values)
+
+        methods = {}
+        for pair in COMPARISONS.values():
+            if any(method not in records for method in pair):
+                continue
+            paired_trials = sorted(set(records[pair[0]]) & set(records[pair[1]]))
+            paired_trials = [
+                trial
+                for trial in paired_trials
+                if records[pair[0]][trial][0] == records[pair[1]][trial][0]
+            ]
+            if not paired_trials:
+                continue
+            for method in pair:
+                methods[METHOD_LABELS[method]] = np.stack(
+                    [records[method][trial][1] for trial in paired_trials]
                 )
-            values.sort(key=lambda item: item[0])
-            if values and len({len(value) for _, value in values}) == 1:
-                methods[label] = np.stack([value for _, value in values])
         traces[problem] = methods
     return traces
 
@@ -278,9 +413,9 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
     metadata = _run_metadata()
 
     for problem_name in args.problems:
-        # Requested ZDT2 protocol; other problems use the command-line defaults.
-        budget = 30 if problem_name == "zdt2" else args.budget
-        initial = 3 if problem_name == "zdt2" else args.initial
+        base_config = _job_config(args, problem_name, 0)
+        budget = base_config["budget"]
+        initial = base_config["initial"]
         if budget < initial:
             raise ValueError("budget must be at least the number of initial points")
         if budget % args.weights:
@@ -296,16 +431,7 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                 seed=seed, raw_samples=args.raw_samples,
                 num_restarts=args.restarts,
             )
-            config = {
-                "dim": args.dim,
-                "budget": budget,
-                "initial": initial,
-                "weights": args.weights,
-                "temperature": args.temperature,
-                "seed": seed,
-                "raw_samples": args.raw_samples,
-                "restarts": args.restarts,
-            }
+            config = _job_config(args, problem_name, trial)
             jobs = {
                 "standard_qlogehvi": lambda: standard_mobo(
                     problem.evaluate, problem.dim, problem.ref_point,
@@ -346,9 +472,7 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                 result = None
                 hypervolume_values = []
                 failed = None
-                timing = dict.fromkeys(
-                    (*TIMING_KEYS, "hypervolume_seconds"), 0.0
-                )
+                timing = dict.fromkeys(RESULT_TIMING_KEYS, 0.0)
                 try:
                     result = jobs[method]()
                     timing.update(result.timing)
@@ -364,21 +488,41 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                         raise RuntimeError(
                             f"{method} used {len(trace)}, expected {budget}"
                         )
+                    timing["total_seconds"] = perf_counter() - started
+                    payload = _result_payload(
+                        problem.name,
+                        method,
+                        trial,
+                        config,
+                        result,
+                        hypervolume_values,
+                        metadata,
+                        None,
+                    )
+                    payload["timing"] = timing
+                    _atomic_write_json(path, payload)
                 except Exception:
                     failed = traceback.format_exc()
-                timing["total_seconds"] = perf_counter() - started
-                payload = _result_payload(
-                    problem.name,
-                    method,
-                    trial,
-                    config,
-                    result,
-                    hypervolume_values,
-                    metadata,
-                    failed,
-                )
-                payload["timing"] = timing
-                _atomic_write_json(path, payload)
+                    timing = dict.fromkeys(RESULT_TIMING_KEYS, 0.0)
+                    timing["total_seconds"] = perf_counter() - started
+                    payload = _result_payload(
+                        problem.name,
+                        method,
+                        trial,
+                        config,
+                        None,
+                        [],
+                        metadata,
+                        failed,
+                    )
+                    payload["timing"] = timing
+                    try:
+                        _atomic_write_json(path, payload)
+                    except Exception:
+                        failed += (
+                            "\nFailure artifact write failed:\n"
+                            + traceback.format_exc()
+                        )
 
                 if failed is not None:
                     print(
@@ -392,7 +536,7 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
                     f"HV={hypervolume_values[-1]:.6f} "
                     f"time={timing['total_seconds']:.1f}s"
                 )
-    return load_traces(args.results_dir, args.problems)
+    return load_traces(args)
 
 
 def plot_results(
@@ -406,15 +550,11 @@ def plot_results(
     output.parent.mkdir(parents=True, exist_ok=True)
     suffix = output.suffix or ".png"
     prefix = output.stem
-    comparisons = {
-        "qlogehvi": ("Standard qLogEHVI", "Composite qLogEHVI"),
-        "stch": ("Objective-GP STCH", "Composite STCH"),
-    }
     colors = ("#0072B2", "#D55E00")
 
     for problem, methods in traces.items():
-        problem_initial = 3 if problem == "zdt2" else initial
-        for comparison_name, method_names in comparisons.items():
+        for comparison_name, method_keys in COMPARISONS.items():
+            method_names = tuple(METHOD_LABELS[key] for key in method_keys)
             if any(method not in methods for method in method_names):
                 continue
             fig, ax = plt.subplots(figsize=(7.2, 4.8))
@@ -433,9 +573,9 @@ def plot_results(
                 )
             ax.axvline(
                 (
-                    problem_initial * weights
+                    initial * weights
                     if comparison_name == "stch"
-                    else problem_initial
+                    else initial
                 ),
                 color="0.45", linestyle="--", linewidth=1,
                 label="End of initial design",
@@ -477,7 +617,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.summary_only:
-        traces = load_traces(args.results_dir, args.problems)
+        traces = load_traces(args)
     else:
         traces = run(args)
         if args.trial is not None or args.method is not None:
