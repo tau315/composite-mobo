@@ -23,6 +23,7 @@ dist/
 *.egg-info/
 
 # Generated benchmark results
+results/
 hypervolume_vs_evaluations*.png
 benchmark_results*.csv
 

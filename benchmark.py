@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+import json
+import platform
 from pathlib import Path
+import subprocess
 from time import perf_counter
+import traceback
 from typing import Callable
 
 import matplotlib.pyplot as plt
@@ -20,6 +25,7 @@ from botorch.utils.multi_objective.pareto import is_non_dominated
 
 from solvers import (
     SolverResult,
+    TIMING_KEYS,
     chebyshev_bo,
     composite_chebyshev_bo,
     composite_mobo,
@@ -28,6 +34,13 @@ from solvers import (
 )
 
 Tensor = torch.Tensor
+
+METHOD_LABELS = {
+    "standard_qlogehvi": "Standard qLogEHVI",
+    "composite_qlogehvi": "Composite qLogEHVI",
+    "objective_gp_stch": "Objective-GP STCH",
+    "composite_stch": "Composite STCH",
+}
 
 
 @dataclass(frozen=True)
@@ -132,10 +145,138 @@ def hypervolume_trace(Y: Tensor, ref_point: Tensor) -> np.ndarray:
     )
 
 
-def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
-    """Run all trials and return arrays shaped (trials, evaluations)."""
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    temporary.replace(path)
 
-    traces: dict[str, dict[str, list[np.ndarray]]] = {}
+
+def _valid_result(path: Path, expected: dict) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    budget = expected.get("budget")
+    series = (payload.get("X"), payload.get("Y"), payload.get("hypervolume"))
+    return (
+        isinstance(budget, int)
+        and payload.get("failed") is None
+        and payload.get("config") == expected
+        and all(isinstance(values, list) and len(values) == budget for values in series)
+    )
+
+
+def _result_payload(
+    problem_name: str,
+    method: str,
+    trial: int,
+    config: dict,
+    result: SolverResult | None,
+    hypervolume_values: list[float],
+    metadata: dict,
+    failed: str | None,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "problem": problem_name,
+        "method": method,
+        "trial": trial,
+        "seed": config["seed"],
+        "config": config,
+        "metadata": metadata,
+        "X": result.X.tolist() if result else [],
+        "Y": result.Y.tolist() if result else [],
+        "components": (
+            result.components.tolist()
+            if result and result.components is not None
+            else None
+        ),
+        "weights": (
+            result.weights.tolist()
+            if result and result.weights is not None
+            else None
+        ),
+        "run_ids": (
+            result.run_ids.tolist()
+            if result and result.run_ids is not None
+            else None
+        ),
+        "hypervolume": hypervolume_values,
+        "wall_seconds": result.wall_seconds if result else [],
+        "timing": dict(result.timing) if result else {},
+        "failed": failed,
+    }
+
+
+def _run_metadata() -> dict:
+    packages = {}
+    for package in ("numpy", "torch", "botorch", "gpytorch", "matplotlib"):
+        try:
+            packages[package] = version(package)
+        except PackageNotFoundError:
+            packages[package] = None
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).parent,
+            check=False,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except OSError:
+        commit = ""
+    return {
+        "python": platform.python_version(),
+        "packages": packages,
+        "git_commit": commit or "unknown",
+    }
+
+
+def load_traces(
+    results_dir: Path, problems: list[str]
+) -> dict[str, dict[str, np.ndarray]]:
+    traces = {}
+    for problem in problems:
+        methods = {}
+        for method, label in METHOD_LABELS.items():
+            values = []
+            for path in (results_dir / problem / method).glob("trial*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                config = payload.get("config")
+                if not isinstance(config, dict) or not _valid_result(path, config):
+                    continue
+                values.append(
+                    (
+                        payload.get("trial", 0),
+                        np.asarray(payload["hypervolume"], dtype=float),
+                    )
+                )
+            values.sort(key=lambda item: item[0])
+            if values and len({len(value) for _, value in values}) == 1:
+                methods[label] = np.stack([value for _, value in values])
+        traces[problem] = methods
+    return traces
+
+
+def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
+    """Run selected jobs atomically and load completed traces from disk."""
+
+    selected_trial = getattr(args, "trial", None)
+    if selected_trial is not None and not 0 <= selected_trial < args.trials:
+        raise ValueError("trial must be zero-based and less than trials")
+    trials = range(args.trials) if selected_trial is None else (selected_trial,)
+    selected_method = getattr(args, "method", None)
+    if selected_method is not None and selected_method not in METHOD_LABELS:
+        raise ValueError(f"unknown method: {selected_method}")
+    methods = tuple(METHOD_LABELS) if selected_method is None else (selected_method,)
+    metadata = _run_metadata()
+
     for problem_name in args.problems:
         # Requested ZDT2 protocol; other problems use the command-line defaults.
         budget = 30 if problem_name == "zdt2" else args.budget
@@ -148,61 +289,117 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, np.ndarray]]:
         if scalar_run_budget < initial:
             raise ValueError("budget / weights must be at least the initial-point count")
         problem = get_problem(problem_name, args.dim)
-        traces[problem.name] = {
-            "Standard qLogEHVI": [],
-            "Composite qLogEHVI": [],
-            "Objective-GP STCH": [],
-            "Composite STCH": [],
-        }
-        for trial in range(args.trials):
+        for trial in trials:
             seed = args.seed + trial
             weights = simplex_weights(args.weights, problem.objectives, seed=seed)
             common = dict(
                 seed=seed, raw_samples=args.raw_samples,
                 num_restarts=args.restarts,
             )
+            config = {
+                "dim": args.dim,
+                "budget": budget,
+                "initial": initial,
+                "weights": args.weights,
+                "temperature": args.temperature,
+                "seed": seed,
+                "raw_samples": args.raw_samples,
+                "restarts": args.restarts,
+            }
             jobs = {
-                "Standard qLogEHVI": lambda: standard_mobo(
+                "standard_qlogehvi": lambda: standard_mobo(
                     problem.evaluate, problem.dim, problem.ref_point,
                     n_init=initial, n_iter=budget - initial, **common,
                 ),
-                "Composite qLogEHVI": lambda: composite_mobo(
+                "composite_qlogehvi": lambda: composite_mobo(
                     problem.evaluate, problem.components, problem.compose,
                     problem.dim, problem.ref_point, n_init=initial,
                     n_iter=budget - initial, **common,
                 ),
-                "Objective-GP STCH": lambda: chebyshev_bo(
+                "objective_gp_stch": lambda: chebyshev_bo(
                     problem.evaluate, problem.dim, weights, problem.ideal,
                     temperature=args.temperature, n_init=initial,
                     n_iter=scalar_run_budget - initial, **common,
                 ),
-                "Composite STCH": lambda: composite_chebyshev_bo(
+                "composite_stch": lambda: composite_chebyshev_bo(
                     problem.evaluate, problem.components, problem.compose,
                     problem.dim, weights, problem.ideal,
                     temperature=args.temperature, n_init=initial,
                     n_iter=scalar_run_budget - initial, **common,
                 ),
             }
-            for method, job in jobs.items():
-                start = perf_counter()
-                result: SolverResult = job()
-                trace = hypervolume_trace(result.Y, problem.ref_point)
-                if len(trace) != budget:
-                    raise RuntimeError(f"{method} used {len(trace)}, expected {budget}")
-                traces[problem.name][method].append(trace)
-                print(
-                    f"{problem.name:6s} trial={trial + 1:02d}/{args.trials} "
-                    f"{method:20s} HV={trace[-1]:.6f} "
-                    f"time={perf_counter() - start:.1f}s"
+            for method in methods:
+                path = (
+                    args.results_dir
+                    / problem.name
+                    / method
+                    / f"trial{trial}.json"
                 )
-    return {
-        problem: {method: np.stack(values) for method, values in methods.items()}
-        for problem, methods in traces.items()
-    }
+                if _valid_result(path, config):
+                    print(
+                        f"{problem.name:6s} trial={trial:02d} "
+                        f"{METHOD_LABELS[method]:20s} resumed"
+                    )
+                    continue
+
+                started = perf_counter()
+                result = None
+                hypervolume_values = []
+                failed = None
+                timing = dict.fromkeys(
+                    (*TIMING_KEYS, "hypervolume_seconds"), 0.0
+                )
+                try:
+                    result = jobs[method]()
+                    timing.update(result.timing)
+                    hypervolume_started = perf_counter()
+                    try:
+                        trace = hypervolume_trace(result.Y, problem.ref_point)
+                    finally:
+                        timing["hypervolume_seconds"] = (
+                            perf_counter() - hypervolume_started
+                        )
+                    hypervolume_values = trace.tolist()
+                    if len(trace) != budget:
+                        raise RuntimeError(
+                            f"{method} used {len(trace)}, expected {budget}"
+                        )
+                except Exception:
+                    failed = traceback.format_exc()
+                timing["total_seconds"] = perf_counter() - started
+                payload = _result_payload(
+                    problem.name,
+                    method,
+                    trial,
+                    config,
+                    result,
+                    hypervolume_values,
+                    metadata,
+                    failed,
+                )
+                payload["timing"] = timing
+                _atomic_write_json(path, payload)
+
+                if failed is not None:
+                    print(
+                        f"{problem.name:6s} trial={trial:02d} "
+                        f"{METHOD_LABELS[method]:20s} FAILED"
+                    )
+                    continue
+                print(
+                    f"{problem.name:6s} trial={trial:02d} "
+                    f"{METHOD_LABELS[method]:20s} "
+                    f"HV={hypervolume_values[-1]:.6f} "
+                    f"time={timing['total_seconds']:.1f}s"
+                )
+    return load_traces(args.results_dir, args.problems)
 
 
 def plot_results(
-    traces: dict[str, dict[str, np.ndarray]], output: Path, initial: int
+    traces: dict[str, dict[str, np.ndarray]],
+    output: Path,
+    initial: int,
+    weights: int = 2,
 ) -> None:
     """Write two separate pairwise-comparison figures per benchmark."""
 
@@ -218,6 +415,8 @@ def plot_results(
     for problem, methods in traces.items():
         problem_initial = 3 if problem == "zdt2" else initial
         for comparison_name, method_names in comparisons.items():
+            if any(method not in methods for method in method_names):
+                continue
             fig, ax = plt.subplots(figsize=(7.2, 4.8))
             for color, method in zip(colors, method_names):
                 values = methods[method]
@@ -233,7 +432,12 @@ def plot_results(
                     evaluations, mean - sem, mean + sem, color=color, alpha=0.2
                 )
             ax.axvline(
-                problem_initial, color="0.45", linestyle="--", linewidth=1,
+                (
+                    problem_initial * weights
+                    if comparison_name == "stch"
+                    else problem_initial
+                ),
+                color="0.45", linestyle="--", linewidth=1,
                 label="End of initial design",
             )
             ax.set_title(f"{problem.upper()}: {method_names[0]} vs {method_names[1]}")
@@ -255,6 +459,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--problems", nargs="+", default=["zdt1", "zdt2", "zdt3", "dtlz2"], choices=["zdt1", "zdt2", "zdt3", "dtlz2"])
     p.add_argument("--dim", type=int, default=6)
     p.add_argument("--trials", type=int, default=20)
+    p.add_argument("--trial", type=int, help="run one zero-based trial")
+    p.add_argument("--method", choices=tuple(METHOD_LABELS), help="run one method")
     p.add_argument("--budget", type=int, default=40, help="total evaluations per method and trial")
     p.add_argument("--initial", type=int, default=5, choices=[5], help="fixed at five as specified")
     p.add_argument("--weights", type=int, default=2)
@@ -262,14 +468,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--raw-samples", type=int, default=128)
     p.add_argument("--restarts", type=int, default=8)
+    p.add_argument("--results-dir", type=Path, default=Path("results"))
+    p.add_argument("--summary-only", action="store_true")
     p.add_argument("--output", type=Path, default=Path("hypervolume_vs_evaluations.png"))
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    traces = run(args)
-    plot_results(traces, args.output, args.initial)
+    if args.summary_only:
+        traces = load_traces(args.results_dir, args.problems)
+    else:
+        traces = run(args)
+        if args.trial is not None or args.method is not None:
+            return
+    plot_results(traces, args.output, args.initial, args.weights)
 
 
 if __name__ == "__main__":
