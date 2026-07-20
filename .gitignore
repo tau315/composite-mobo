@@ -24,6 +24,8 @@ dist/
 
 # Generated benchmark results
 hypervolume_vs_evaluations*.png
+hypervolume_*.png
+smoke_*.png
 benchmark_results*.csv
 
 # LaTeX build artifacts (keep the .tex source)
@@ -47,4 +49,3 @@ benchmark_results*.csv
 .DS_Store
 Thumbs.db
 desktop.ini
-

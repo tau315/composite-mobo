@@ -2,9 +2,9 @@
 
 All public solvers assume that ``evaluate(X)`` returns objectives to *minimize*.
 Composite solvers additionally receive ``evaluate_components(X)`` and a known,
-differentiable ``compose(C, X)`` map satisfying
-``compose(components(X), X) == f(X)``. The GP models only unknown intermediate
-outputs; analytically known functions of ``X`` remain exact in the outer map.
+differentiable ``compose(H)`` map satisfying
+``compose(evaluate_components(X)) == evaluate(X)``. Thus the implemented
+composite graph is strictly ``X -> h(X) -> g(h(X))``.
 Internally objectives are negated because BoTorch's acquisition functions use a
 maximization convention.
 """
@@ -12,9 +12,10 @@ maximization convention.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import shutil
 import sys
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import torch
 from botorch.acquisition.logei import qLogExpectedImprovement
@@ -36,10 +37,15 @@ from botorch.utils.multi_objective.box_decompositions.non_dominated import (
     NondominatedPartitioning,
 )
 from gpytorch.mlls import ExactMarginalLogLikelihood, SumMarginalLogLikelihood
+from gpytorch.constraints import GreaterThan, Interval
+from gpytorch.kernels import Kernel, MaternKernel, ScaleKernel
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.means import ConstantMean
+from gpytorch.priors import GammaPrior, LogNormalPrior
 
 Tensor = torch.Tensor
 Evaluator = Callable[[Tensor], Tensor]
-Composer = Callable[[Tensor, Tensor], Tensor]
+Composer = Callable[[Tensor], Tensor]
 
 # BoTorch 0.18 tries to JIT-build an optional fused qLogEHVI kernel. On Windows
 # without the MSVC compiler this produces a long subprocess traceback before
@@ -61,6 +67,35 @@ class SolverResult:
     run_ids: Optional[Tensor] = None
 
 
+@dataclass(frozen=True)
+class ObjectivewiseComposer:
+    """Compose objectives from arbitrary groups of intermediate functions.
+
+    ``component_groups[i]`` identifies the h_ij values used by objective i, and
+    ``objective_maps[i]`` implements f_i = g_i(h_i1, ..., h_ik_i).
+    Groups may have different sizes and may overlap. Each column of H is still
+    modeled by its own independent GP.
+    """
+
+    component_groups: Sequence[Sequence[int]]
+    objective_maps: Sequence[Callable[[Tensor], Tensor]]
+
+    def __post_init__(self) -> None:
+        if len(self.component_groups) != len(self.objective_maps):
+            raise ValueError("one component group is required per objective")
+        if any(len(group) == 0 for group in self.component_groups):
+            raise ValueError("every objective requires at least one component")
+        if any(index < 0 for group in self.component_groups for index in group):
+            raise ValueError("component indices must be non-negative")
+
+    def __call__(self, H: Tensor) -> Tensor:
+        outputs = [
+            outer(H[..., list(group)])
+            for group, outer in zip(self.component_groups, self.objective_maps)
+        ]
+        return torch.stack(outputs, dim=-1)
+
+
 def smooth_tchebycheff(
     Y: Tensor, weights: Tensor, ideal: Tensor, temperature: float = 0.05
 ) -> Tensor:
@@ -72,9 +107,7 @@ def smooth_tchebycheff(
 
     if temperature <= 0:
         raise ValueError("temperature must be positive")
-    return temperature * torch.logsumexp(
-        weights * (Y - ideal) / temperature, dim=-1
-    )
+    return temperature * torch.logsumexp(weights * (Y - ideal) / temperature, dim=-1)
 
 
 def simplex_weights(n: int, m: int, *, seed: int = 0) -> Tensor:
@@ -137,12 +170,12 @@ def _optimize(acq, d: int, raw_samples: int, num_restarts: int) -> Tensor:
         return candidates[values.argmax()].detach()
 
 
-def _check_composition(C: Tensor, X: Tensor, Y: Tensor, compose: Composer) -> None:
-    reconstructed = compose(C, X)
+def _check_composition(C: Tensor, Y: Tensor, compose: Composer) -> None:
+    reconstructed = compose(C)
     if reconstructed.shape != Y.shape or not torch.allclose(
         reconstructed, Y, atol=1e-7, rtol=1e-5
     ):
-        raise ValueError("compose(evaluate_components(X), X) must equal evaluate(X)")
+        raise ValueError("compose(evaluate_components(X)) must equal evaluate(X)")
 
 
 def standard_mobo(
@@ -150,8 +183,8 @@ def standard_mobo(
     dim: int,
     ref_point: Tensor,
     *,
-    n_init: int = 8,
-    n_iter: int = 24,
+    n_init: int = 5,
+    n_iter: int = 40,
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
@@ -180,8 +213,8 @@ def composite_mobo(
     dim: int,
     ref_point: Tensor,
     *,
-    n_init: int = 8,
-    n_iter: int = 24,
+    n_init: int = 5,
+    n_iter: int = 40,
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
@@ -191,11 +224,9 @@ def composite_mobo(
     torch.manual_seed(seed)
     X = _sobol(n_init, dim, seed)
     C, Y = evaluate_components(X).double(), evaluate(X).double()
-    _check_composition(C, X, Y, compose)
+    _check_composition(C, Y, compose)
     ref_max = -torch.as_tensor(ref_point, dtype=torch.double)
-    objective = GenericMCMultiOutputObjective(
-        lambda samples, X=None: -compose(samples, X)
-    )
+    objective = GenericMCMultiOutputObjective(lambda samples, X=None: -compose(samples))
     for _ in range(n_iter):
         model = _independent_gp(X, C)
         partitioning = NondominatedPartitioning(ref_point=ref_max, Y=-Y)
@@ -218,59 +249,66 @@ def _scalarized_runs(
     ideal: Tensor,
     temperature: float,
     n_init: int,
-    n_iter: int,
+    n_per_scalarization: int,
     seed: int,
     raw_samples: int,
     num_restarts: int,
     evaluate_components: Optional[Evaluator] = None,
     compose: Optional[Composer] = None,
 ) -> SolverResult:
-    all_x, all_y, all_c, ids = [], [], [], []
-    for run_id, weight in enumerate(weights.double()):
-        run_seed = seed + 104729 * run_id
-        torch.manual_seed(run_seed)
-        X = _sobol(n_init, dim, run_seed)
-        Y = evaluate(X).double()
-        if evaluate_components is None:
-            C = None
-        else:
-            C = evaluate_components(X).double()
-            _check_composition(C, X, Y, compose)  # type: ignore[arg-type]
-        for _ in range(n_iter):
+    """Branch every weight from one shared, once-evaluated initial design."""
+    torch.manual_seed(seed)
+    X_initial = _sobol(n_init, dim, seed)
+    Y_initial = evaluate(X_initial).double()
+    C_initial = (
+        evaluate_components(X_initial).double()
+        if evaluate_components is not None
+        else None
+    )
+    if C_initial is not None:
+        _check_composition(C_initial, Y_initial, compose)  # type: ignore[arg-type]
+
+    all_x, all_y = [X_initial], [Y_initial]
+    all_c = [C_initial] if C_initial is not None else []
+    ids = [torch.full((n_init,), -1, dtype=torch.long)]
+    for weight_id, weight in enumerate(weights.double()):
+        torch.manual_seed(seed + 104729 * weight_id)
+        X, Y = X_initial.clone(), Y_initial.clone()
+        C = C_initial.clone() if C_initial is not None else None
+        for _ in range(n_per_scalarization):
             if C is None:
-                # Paper-style CBO: model f_1,...,f_m directly, then apply the
-                # known STCH map to joint posterior samples inside EI.
                 model = _independent_gp(X, Y)
                 objective = GenericMCObjective(
-                    lambda samples, X=None, w=weight: -smooth_tchebycheff(
-                        samples, w, ideal, temperature
+                    lambda samples, X=None, w=weight: (
+                        -smooth_tchebycheff(samples, w, ideal, temperature)
                     )
-                )
-                observed_utility = -smooth_tchebycheff(Y, weight, ideal, temperature)
-                acq = qLogExpectedImprovement(
-                    model=model, best_f=observed_utility.max(), objective=objective
                 )
             else:
                 model = _independent_gp(X, C)
                 objective = GenericMCObjective(
-                    lambda samples, X=None, w=weight: -smooth_tchebycheff(
-                        compose(samples, X), w, ideal, temperature  # type: ignore[misc]
+                    lambda samples, X=None, w=weight: (
+                        -smooth_tchebycheff(
+                            compose(samples),
+                            w,
+                            ideal,
+                            temperature,  # type: ignore[misc]
+                        )
                     )
                 )
-                observed_utility = -smooth_tchebycheff(Y, weight, ideal, temperature)
-                acq = qLogExpectedImprovement(
-                    model=model, best_f=observed_utility.max(), objective=objective
-                )
+            observed_utility = -smooth_tchebycheff(Y, weight, ideal, temperature)
+            acq = qLogExpectedImprovement(
+                model=model, best_f=observed_utility.max(), objective=objective
+            )
             x = _optimize(acq, dim, raw_samples, num_restarts)
             y = evaluate(x).double()
             X, Y = torch.cat((X, x)), torch.cat((Y, y))
             if C is not None:
                 C = torch.cat((C, evaluate_components(x).double()))  # type: ignore[misc]
-        all_x.append(X)
-        all_y.append(Y)
-        ids.append(torch.full((len(X),), run_id, dtype=torch.long))
+        all_x.append(X[n_init:])
+        all_y.append(Y[n_init:])
+        ids.append(torch.full((n_per_scalarization,), weight_id, dtype=torch.long))
         if C is not None:
-            all_c.append(C)
+            all_c.append(C[n_init:])
     return SolverResult(
         X=torch.cat(all_x),
         Y=torch.cat(all_y),
@@ -287,8 +325,8 @@ def chebyshev_bo(
     ideal: Tensor,
     *,
     temperature: float = 0.05,
-    n_init: int = 6,
-    n_iter: int = 12,
+    n_init: int = 5,
+    n_per_scalarization: int = 5,
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
@@ -296,8 +334,16 @@ def chebyshev_bo(
     """Objective GPs and EI through STCH posterior samples, one run per weight."""
 
     return _scalarized_runs(
-        evaluate, dim, weights, ideal.double(), temperature, n_init, n_iter,
-        seed, raw_samples, num_restarts,
+        evaluate,
+        dim,
+        weights,
+        ideal.double(),
+        temperature,
+        n_init,
+        n_per_scalarization,
+        seed,
+        raw_samples,
+        num_restarts,
     )
 
 
@@ -310,8 +356,8 @@ def composite_chebyshev_bo(
     ideal: Tensor,
     *,
     temperature: float = 0.05,
-    n_init: int = 6,
-    n_iter: int = 12,
+    n_init: int = 5,
+    n_per_scalarization: int = 5,
     seed: int = 0,
     raw_samples: int = 128,
     num_restarts: int = 8,
@@ -319,6 +365,381 @@ def composite_chebyshev_bo(
     """Node GPs and EI on the double-composed smooth-Tchebycheff posterior."""
 
     return _scalarized_runs(
-        evaluate, dim, weights, ideal.double(), temperature, n_init, n_iter,
-        seed, raw_samples, num_restarts, evaluate_components, compose,
+        evaluate,
+        dim,
+        weights,
+        ideal.double(),
+        temperature,
+        n_init,
+        n_per_scalarization,
+        seed,
+        raw_samples,
+        num_restarts,
+        evaluate_components,
+        compose,
+    )
+
+
+# ---------------------------------------------------------------------------
+# High-dimensional spherical-linear BO (Doumont et al., AISTATS 2026)
+# ---------------------------------------------------------------------------
+
+
+def inverse_stereographic_projection(X: Tensor) -> Tensor:
+    """Map R^d bijectively to the unit sphere S^d (paper Eq. 4)."""
+
+    norm2 = X.square().sum(dim=-1, keepdim=True)
+    return torch.cat((2.0 * X, norm2 - 1.0), dim=-1) / (1.0 + norm2)
+
+
+class SphericalLinearKernel(Kernel):
+    """Paper-faithful spherical linear kernel.
+
+    Inputs are centered, divided by ARD scales and a decoupled global scale,
+    inverse-stereographically projected, and evaluated with
+    k(x,x') = b0 + b1 P(z)^T P(z'), where (b0,b1) lies on the simplex.
+    """
+
+    has_lengthscale = True
+
+    def __init__(self, dim: int, bounds: tuple[float, float] = (0.0, 1.0)):
+        prior = LogNormalPrior(math.sqrt(2.0), math.sqrt(3.0))
+        super().__init__(
+            ard_num_dims=dim,
+            lengthscale_prior=prior,
+            lengthscale_constraint=GreaterThan(
+                2.5e-2, transform=None, initial_value=prior.mode
+            ),
+        )
+        self.register_buffer("centers", torch.full((dim,), sum(bounds) / 2))
+        self.register_buffer("widths", torch.full((dim,), bounds[1] - bounds[0]))
+        self.register_parameter("raw_coeffs", torch.nn.Parameter(torch.zeros(2)))
+        self.register_parameter("raw_global_scale", torch.nn.Parameter(torch.zeros(1)))
+
+    @property
+    def coefficients(self) -> Tensor:
+        return torch.softmax(self.raw_coeffs, dim=-1)
+
+    def _features(self, X: Tensor) -> Tensor:
+        scaled = (X - self.centers) / self.lengthscale
+        max_norm2 = (
+            (self.widths / (2.0 * self.lengthscale.squeeze(-2))).square().sum(-1)
+        )
+        global_scale = torch.sqrt(torch.sigmoid(self.raw_global_scale) * max_norm2)
+        projected = inverse_stereographic_projection(scaled / global_scale)
+        b0, b1 = self.coefficients
+        return torch.cat(
+            (projected * b1.sqrt(), b0.sqrt().expand(*projected.shape[:-1], 1)),
+            dim=-1,
+        )
+
+    def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params):
+        phi1, phi2 = self._features(x1), self._features(x2)
+        if diag:
+            return (phi1 * phi2).sum(dim=-1)
+        return phi1 @ phi2.transpose(-1, -2)
+
+
+def _spherical_gp(X: Tensor, Y: Tensor) -> ModelListGP:
+    """Independent paper-style spherical-linear GPs for every output."""
+
+    models = []
+    for i in range(Y.shape[-1]):
+        noise_prior = LogNormalPrior(-4.0, 1.0)
+        likelihood = GaussianLikelihood(
+            noise_prior=noise_prior,
+            noise_constraint=GreaterThan(1e-4, initial_value=noise_prior.mode),
+        )
+        models.append(
+            SingleTaskGP(
+                X,
+                Y[:, i : i + 1],
+                mean_module=ConstantMean(),
+                covar_module=SphericalLinearKernel(X.shape[-1]),
+                likelihood=likelihood,
+                outcome_transform=Standardize(m=1),
+            )
+        )
+    model = ModelListGP(*models)
+    fit_gpytorch_mll(SumMarginalLogLikelihood(model.likelihood, model))
+    return model
+
+
+def _high_dim_scalarized_runs(
+    evaluate: Evaluator,
+    dim: int,
+    weights: Tensor,
+    ideal: Tensor,
+    *,
+    temperature: float = 0.05,
+    n_init: int = 5,
+    n_per_scalarization: int = 5,
+    seed: int = 0,
+    raw_samples: int = 256,
+    num_restarts: int = 10,
+    evaluate_components: Optional[Evaluator] = None,
+    compose: Optional[Composer] = None,
+) -> SolverResult:
+    """Spherical-linear STCH with one shared initial design."""
+    torch.manual_seed(seed)
+    X_initial = _sobol(n_init, dim, seed)
+    Y_initial = evaluate(X_initial).double()
+    C_initial = (
+        evaluate_components(X_initial).double()
+        if evaluate_components is not None
+        else None
+    )
+    if C_initial is not None:
+        _check_composition(C_initial, Y_initial, compose)  # type: ignore[arg-type]
+
+    all_x, all_y = [X_initial], [Y_initial]
+    all_c = [C_initial] if C_initial is not None else []
+    all_ids = [torch.full((n_init,), -1, dtype=torch.long)]
+    for weight_id, weight in enumerate(weights.double()):
+        torch.manual_seed(seed + 104729 * weight_id)
+        X, Y = X_initial.clone(), Y_initial.clone()
+        C = C_initial.clone() if C_initial is not None else None
+        for _ in range(n_per_scalarization):
+            training_values = Y if C is None else C
+            model = _spherical_gp(X, training_values)
+            if C is None:
+                objective = GenericMCObjective(
+                    lambda samples, X=None, w=weight: (
+                        -smooth_tchebycheff(samples, w, ideal, temperature)
+                    )
+                )
+            else:
+                objective = GenericMCObjective(
+                    lambda samples, X=None, w=weight: (
+                        -smooth_tchebycheff(
+                            compose(samples),
+                            w,
+                            ideal,
+                            temperature,  # type: ignore[misc]
+                        )
+                    )
+                )
+            observed_utility = -smooth_tchebycheff(Y, weight, ideal, temperature)
+            acq = qLogExpectedImprovement(
+                model=model, best_f=observed_utility.max(), objective=objective
+            )
+            x = _optimize(acq, dim, raw_samples, num_restarts)
+            y = evaluate(x).double()
+            X, Y = torch.cat((X, x)), torch.cat((Y, y))
+            if C is not None:
+                C = torch.cat((C, evaluate_components(x).double()))  # type: ignore[misc]
+        all_x.append(X[n_init:])
+        all_y.append(Y[n_init:])
+        all_ids.append(torch.full((n_per_scalarization,), weight_id, dtype=torch.long))
+        if C is not None:
+            all_c.append(C[n_init:])
+    return SolverResult(
+        X=torch.cat(all_x),
+        Y=torch.cat(all_y),
+        components=torch.cat(all_c) if all_c else None,
+        weights=weights,
+        run_ids=torch.cat(all_ids),
+    )
+
+
+def spherical_chebyshev_bo(
+    evaluate: Evaluator, dim: int, weights: Tensor, ideal: Tensor, **kwargs
+) -> SolverResult:
+    """Eight-weight STCH using five acquisitions per weight by default."""
+    return _high_dim_scalarized_runs(evaluate, dim, weights, ideal.double(), **kwargs)
+
+
+def composite_spherical_chebyshev_bo(
+    evaluate: Evaluator,
+    evaluate_components: Evaluator,
+    compose: Composer,
+    dim: int,
+    weights: Tensor,
+    ideal: Tensor,
+    **kwargs,
+) -> SolverResult:
+    """Spherical-linear GPs on h_ij, followed by composition and STCH."""
+    return _high_dim_scalarized_runs(
+        evaluate,
+        dim,
+        weights,
+        ideal.double(),
+        evaluate_components=evaluate_components,
+        compose=compose,
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MORBO: coordinated multi-trust-region multi-objective optimization
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MORBOConfig:
+    n_trust_regions: int = 5
+    length_init: float = 0.8
+    length_min: float = 0.01
+    length_max: float = 1.6
+    success_streak: int = 10_000
+    failure_streak: Optional[int] = None
+    raw_samples: int = 512
+
+
+def _morbo_gp(X: Tensor, Y: Tensor) -> ModelListGP:
+    models = []
+    for i in range(Y.shape[-1]):
+        kernel = ScaleKernel(
+            MaternKernel(
+                nu=2.5,
+                ard_num_dims=X.shape[-1],
+                lengthscale_constraint=Interval(0.05, 4.0),
+            )
+        )
+        likelihood = GaussianLikelihood(
+            noise_constraint=GreaterThan(1e-6),
+            noise_prior=GammaPrior(0.9, 10.0),
+        )
+        models.append(
+            SingleTaskGP(
+                X,
+                Y[:, i : i + 1],
+                covar_module=kernel,
+                likelihood=likelihood,
+                outcome_transform=Standardize(m=1),
+            )
+        )
+    model = ModelListGP(*models)
+    fit_gpytorch_mll(SumMarginalLogLikelihood(model.likelihood, model))
+    return model
+
+
+def _hv_max(Y: Tensor, ref: Tensor) -> float:
+    from botorch.utils.multi_objective.hypervolume import Hypervolume
+    from botorch.utils.multi_objective.pareto import is_non_dominated
+
+    valid = (Y > ref).all(dim=-1)
+    if not valid.any():
+        return 0.0
+    P = Y[valid]
+    P = P[is_non_dominated(P)]
+    return float(Hypervolume(ref_point=ref).compute(P))
+
+
+def _morbo(
+    evaluate: Evaluator,
+    dim: int,
+    ref_point: Tensor,
+    *,
+    n_init: int = 5,
+    n_iter: int = 40,
+    seed: int = 0,
+    config: Optional[MORBOConfig] = None,
+    evaluate_components: Optional[Evaluator] = None,
+    compose: Optional[Composer] = None,
+) -> SolverResult:
+    """Sequential MORBO core with coordinated local Thompson/HVI selection."""
+    cfg = config or MORBOConfig()
+    failure_streak = cfg.failure_streak or max(dim // 3, 10)
+    torch.manual_seed(seed)
+    X = _sobol(n_init, dim, seed)
+    Y = evaluate(X).double()
+    C = evaluate_components(X).double() if evaluate_components else None
+    if C is not None:
+        _check_composition(C, Y, compose)  # type: ignore[arg-type]
+    ref = -torch.as_tensor(ref_point, dtype=torch.double)
+    ntr = cfg.n_trust_regions
+    pareto_ids = torch.where(
+        torch.tensor(
+            [
+                not ((Y <= Y[i]).all(-1) & (Y < Y[i]).any(-1)).any()
+                for i in range(len(Y))
+            ]
+        )
+    )[0]
+    centers = X[pareto_ids[:ntr]].clone()
+    while len(centers) < ntr:
+        centers = torch.cat((centers, X[torch.randint(len(X), (1,))]))
+    lengths = torch.full((ntr,), cfg.length_init, dtype=torch.double)
+    failures = torch.zeros(ntr, dtype=torch.long)
+    successes = torch.zeros_like(failures)
+    previous_hv = _hv_max(-Y, ref)
+    for step in range(n_iter):
+        best_x, best_score, best_tr = None, float("-inf"), 0
+        for tr in range(ntr):
+            local = ((X - centers[tr]).abs() <= lengths[tr]).all(-1)
+            if local.sum() < min(3, len(X)):
+                local = torch.ones(len(X), dtype=torch.bool)
+            train = Y[local] if C is None else C[local]
+            model = _morbo_gp(X[local], -train if C is None else train)
+            sobol = _sobol(cfg.raw_samples, dim, seed + 7919 * (step + 1) + tr)
+            lo = (centers[tr] - lengths[tr] / 2).clamp(0, 1)
+            hi = (centers[tr] + lengths[tr] / 2).clamp(0, 1)
+            cand = lo + (hi - lo) * sobol
+            prob = min(20.0 / dim, 1.0)
+            mask = torch.rand_like(cand) < prob
+            empty = ~mask.any(-1)
+            mask[empty, torch.randint(dim, (int(empty.sum()),))] = True
+            cand = torch.where(mask, cand, centers[tr])
+            with torch.no_grad():
+                sample = model.posterior(cand).rsample().squeeze(0)
+            obj_sample = sample if C is None else -compose(sample)  # type: ignore[misc]
+            base = _hv_max(-Y, ref)
+            scores = torch.tensor(
+                [_hv_max(torch.cat((-Y, v[None])), ref) - base for v in obj_sample]
+            )
+            idx = int(scores.argmax())
+            if float(scores[idx]) > best_score:
+                best_x, best_score, best_tr = (
+                    cand[idx : idx + 1],
+                    float(scores[idx]),
+                    tr,
+                )
+        x = best_x
+        y = evaluate(x).double()  # type: ignore[arg-type]
+        X, Y = torch.cat((X, x)), torch.cat((Y, y))
+        if C is not None:
+            C = torch.cat((C, evaluate_components(x).double()))  # type: ignore[misc]
+        new_hv = _hv_max(-Y, ref)
+        if new_hv > previous_hv + 1e-3 * max(abs(previous_hv), 1.0):
+            successes[best_tr] += 1
+            failures[best_tr] = 0
+            if successes[best_tr] >= cfg.success_streak:
+                lengths[best_tr] = min(2 * lengths[best_tr], cfg.length_max)
+                successes[best_tr] = 0
+        else:
+            failures[best_tr] += 1
+            successes[best_tr] = 0
+            if failures[best_tr] >= failure_streak:
+                lengths[best_tr] /= 2
+                failures[best_tr] = 0
+        centers[best_tr] = x.squeeze(0)
+        if lengths[best_tr] < cfg.length_min:
+            centers[best_tr] = _sobol(1, dim, seed + 99991 + step).squeeze(0)
+            lengths[best_tr] = cfg.length_init
+        previous_hv = new_hv
+    return SolverResult(X=X, Y=Y, components=C)
+
+
+def morbo(evaluate: Evaluator, dim: int, ref_point: Tensor, **kwargs) -> SolverResult:
+    """Direct-objective MORBO."""
+    return _morbo(evaluate, dim, ref_point, **kwargs)
+
+
+def composite_morbo(
+    evaluate: Evaluator,
+    evaluate_components: Evaluator,
+    compose: Composer,
+    dim: int,
+    ref_point: Tensor,
+    **kwargs,
+) -> SolverResult:
+    """MORBO with local GPs on objective-specific composite subfunctions."""
+    return _morbo(
+        evaluate,
+        dim,
+        ref_point,
+        evaluate_components=evaluate_components,
+        compose=compose,
+        **kwargs,
     )

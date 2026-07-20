@@ -1,259 +1,243 @@
-# Composite-Function Multi-Objective Bayesian Optimization
+# Composite Multi-Objective Bayesian Optimization Solvers
 
-This project tests whether exploiting a known composite objective structure can
-improve sample efficiency in low-dimensional, multi-objective Bayesian
-optimization (MOBO).
+This repository contains direct and composite multi-objective BO solvers plus
+six reproducible benchmark scripts. Each benchmark is defined in its own file,
+while `benchmark_common.py` keeps the trial, hypervolume, and plotting protocol
+identical across problems.
 
-The central comparison is between learning final objectives directly,
+## Problem interface
 
-$$
-\mathbf{x}\longrightarrow \bigl(f_1(\mathbf{x}),f_2(\mathbf{x})\bigr),
-$$
+All objectives are minimized on `[0, 1]^d`.
 
-and learning an observable inner response before applying a known outer map,
+Direct solvers require:
 
-$$
-\mathbf{x}\longrightarrow h(\mathbf{x})
-\longrightarrow
-\Phi\bigl(h(\mathbf{x}),\mathbf{x}\bigr)
-=\bigl(f_1(\mathbf{x}),f_2(\mathbf{x})\bigr).
-$$
+```python
+evaluate(X) -> Y                 # n x m objectives
+```
 
-The benchmark measures Pareto-front recovery using dominated hypervolume versus
-the total number of expensive function evaluations.
+Composite solvers require:
 
-## Methods
+```python
+evaluate_components(X) -> H      # n x p intermediate values
+compose(H) -> Y                  # n x m objectives
+```
 
-Four solvers are implemented in `solvers.py`.
+with `compose(evaluate_components(X)) == evaluate(X)`.
 
-### Standard qLogEHVI
-
-`standard_mobo` fits one independent Gaussian process to each final objective.
-It selects new points with BoTorch's numerically stable
-`qLogExpectedHypervolumeImprovement` acquisition function.
-
-### Composite qLogEHVI
-
-`composite_mobo` fits Gaussian processes to observable intermediate responses.
-Monte Carlo component-posterior samples are passed through the known objective
-composition, and qLogEHVI is evaluated on the resulting non-Gaussian objective
-samples.
-
-Known quantities such as a candidate coordinate `x1` remain exact and are not
-given artificial GP uncertainty.
-
-### Objective-GP smooth Tchebycheff BO
-
-`chebyshev_bo` fits the final objectives directly. For each preference weight,
-posterior objective samples are transformed using
+The intended structure is objective-specific:
 
 $$
-S_{\tau,\mathbf{w}}(\mathbf{f})
-=\tau\log\sum_i
+f_i(x)=g_i\left(h_{i1}(x),\ldots,h_{ik_i}(x)\right),
+$$
+
+Each objective may use a different number of intermediate functions. Component
+groups may also overlap; every component column is modeled by its own independent
+GP, and each known outer function receives the columns assigned to that objective.
+
+Example:
+
+```python
+composer = ObjectivewiseComposer(
+    component_groups=[[0, 1], [2, 3, 4]],
+    objective_maps=[
+        lambda H1: (torch.cos(H1[..., 0]) + 1) * torch.sin(H1[..., 1]),
+        lambda H2: H2[..., 0]**2 + H2[..., 1] * H2[..., 2],
+    ],
+)
+```
+
+This represents
+
+$$
+f_1=g_1(h_{11},h_{12}),\qquad
+f_2=g_2(h_{21},h_{22},h_{23}).
+$$
+
+## Benchmark suite
+
+| Script | Problem | Components per objective | Solver comparison |
+|---|---|---|---|
+| `benchmark_dtlz2.py` | DTLZ2, 2 objectives, 6D | 2 + 2 | qLogEHVI and STCH |
+| `benchmark_ackley_griewank_6d.py` | Ackley--Griewank, 2 objectives, 6D | 2 + 2 | qLogEHVI and STCH |
+| `benchmark_five_ackley_6d.py` | Five shifted Ackley objectives, 6D | 2 each | qLogEHVI and STCH |
+| `benchmark_langermann_ackley_6d.py` | Langermann--Ackley, 2 objectives, 6D | 3 + 2 | qLogEHVI and STCH |
+| `benchmark_ackley_griewank_50d.py` | Ackley--Griewank, 2 objectives, 50D | 2 + 2 | spherical STCH and MORBO |
+| `benchmark_projected_langermann_500d.py` | Projected Langermann, 2 objectives, 500D | 4 + 5 | spherical STCH and MORBO |
+
+Running a script with no flags performs 20 independent trials and saves a
+two-panel Matplotlib PNG. Each panel contains only one direct/composite pair,
+with the trial mean as a solid line and its standard error as a shaded band.
+No CSV file is produced.
+
+```powershell
+python benchmark_dtlz2.py
+python benchmark_ackley_griewank_6d.py
+python benchmark_five_ackley_6d.py
+python benchmark_langermann_ackley_6d.py
+python benchmark_ackley_griewank_50d.py
+python benchmark_projected_langermann_500d.py
+```
+
+Use `--show` to open the plot after saving it. Use `--quick` only to verify an
+installation with a tiny one-trial run. Other useful overrides include
+`--trials`, `--iterations`, `--weights`, `--per-weight`, `--raw-samples`, and
+`--output`.
+
+### Fixed hypervolume reference points
+
+Every objective uses the fixed reference coordinate `2.5`. Thus the reference
+is `(2.5, 2.5)` for two-objective problems and `(2.5, ..., 2.5)` for the
+five-objective problem. The same tensor is passed to the acquisition functions
+and the plotted dominated-hypervolume metric.
+
+DTLZ2 has the exact maximum
+
+$$
+2.5^2-\frac{\pi}{4}=5.464602.
+$$
+
+For the normalized custom objectives, the ideal/reference box ceiling is
+`6.25` with two objectives and `97.65625` with five objectives. The custom
+ideal vectors are not jointly attainable, so these are rigorous upper bounds
+rather than exact attainable front hypervolumes. Every graph displays the
+applicable exact maximum or ceiling as a dotted horizontal line. Its two panels
+share one y-axis scale.
+
+## Standard protocol
+
+Public solvers default to:
+
+- 5 scrambled-Sobol initial evaluations;
+- 40 adaptive evaluations after initialization;
+- double-precision tensors;
+- sequential acquisition (`q=1`).
+
+Scalarization studies should create eight weights:
+
+```python
+weights = simplex_weights(8, number_of_objectives, seed=seed)
+```
+
+Both low- and high-dimensional STCH solvers evaluate one shared five-point
+initial design, then branch into eight scalarizations. Each weight adds five
+adaptive points, for exactly
+
+$$
+5 + 8\times 5 = 45
+$$
+
+unique expensive evaluations. Scalarization branches share the initial data but
+do not use points acquired by other weights when fitting their own GP.
+
+## Low-dimensional solvers
+
+### `standard_mobo`
+
+Fits an independent exact GP to every final objective and selects points with
+qLogEHVI.
+
+### `composite_mobo`
+
+Fits an independent exact GP to every intermediate function. Posterior
+component samples are passed through `compose`, and qLogEHVI is evaluated on
+the resulting objective samples.
+
+### `chebyshev_bo`
+
+Fits objective GPs and applies smooth Tchebycheff scalarization inside qLogEI:
+
+$$
+S_{\tau,w}(f)=\tau\log\sum_i
 \exp\left(\frac{w_i(f_i-z_i^\star)}{\tau}\right).
 $$
 
-Because the benchmarks are minimization problems, the acquisition utility is
-`-S`. A separate qLogEI run is performed for each weight.
+### `composite_chebyshev_bo`
 
-### Composite smooth Tchebycheff BO
-
-`composite_chebyshev_bo` models the intermediate responses and propagates their
-posterior samples through both the known objective map and smooth Tchebycheff
-scalarization:
+Fits component GPs and evaluates
 
 $$
-\mathbf{x}\rightarrow h(\mathbf{x})
-\rightarrow\mathbf{f}(\mathbf{x})
-\rightarrow S_{\tau,\mathbf{w}}(\mathbf{f}(\mathbf{x})).
+-S_{\tau,w}\left(g_1(h_1),\ldots,g_m(h_m)\right)
 $$
 
-This is the fully nested composite method.
+inside qLogEI.
 
-## Benchmarks
+## High-dimensional spherical-linear solvers
 
-`benchmark.py` provides four deterministic, unconstrained benchmark problems.
-All inputs are bounded to `[0, 1]^d`; the default dimension is six.
+These use the model from Doumont et al., *We Still Don't Understand
+High-Dimensional Bayesian Optimization*.
 
-### ZDT1, ZDT2, and ZDT3
-
-The ZDT problems share
-
-$$
-g(\mathbf{x})=1+\frac{9}{d-1}\sum_{j=2}^{d}x_j,
-\qquad f_1(\mathbf{x})=x_1.
-$$
-
-The direct methods fit GPs to `f1` and `f2`. The current composite methods fit
-one GP to
+Inputs are centered, divided by ARD scales and a decoupled global scale, then
+mapped by inverse stereographic projection:
 
 $$
-u(\mathbf{x})=\log g(\mathbf{x})
+P(z)=\frac{[2z,\|z\|^2-1]}{1+\|z\|^2}.
 $$
 
-and reconstruct `g = exp(u)`. This warped representation guarantees positive
-posterior component samples for outer functions that divide by `g`. It is not
-the same prior as placing a GP directly on `g`, and this distinction should be
-reported when interpreting results.
-
-- ZDT1 has a continuous convex Pareto front.
-- ZDT2 has a continuous non-convex Pareto front.
-- ZDT3 has a disconnected Pareto front.
-
-### DTLZ2
-
-For two objectives and six inputs,
+The kernel is
 
 $$
-g(\mathbf{x})=\sum_{j=2}^{6}(x_j-0.5)^2,
+k(x,x')=b_0+b_1P(z)^\top P(z'),\qquad b_0+b_1=1,
 $$
 
-$$
-f_1=(1+g)\cos(\pi x_1/2),
-\qquad
-f_2=(1+g)\sin(\pi x_1/2).
-$$
+with simplex coefficients, the paper's DSP-like unscaled ARD prior, a constant
+mean, and its bounded-noise log-normal likelihood.
 
-The direct methods fit GPs to `f1` and `f2`. The composite methods fit one GP
-directly to `g` and use the exact candidate coordinate `x1` in the known outer
-map. The Pareto front is the positive quadrant of the unit circle.
+### `spherical_chebyshev_bo`
 
-## Experimental protocol
+Fits spherical-linear GPs to final objectives, then applies STCH and qLogEI.
 
-The default experiment uses:
+### `composite_spherical_chebyshev_bo`
 
-- 20 independent trials
-- Trial seeds `0, 1, ..., 19`
-- Matched seeds for corresponding direct and composite methods
-- Scrambled Sobol initial designs
-- Two scalarization weights: `(0.05, 0.95)` and `(0.95, 0.05)`
-- Smooth-Tchebycheff temperature `0.05`
-- Ideal point `(0, 0)`
+Fits spherical-linear GPs to objective-specific intermediate functions, then
+applies the known outer maps, STCH, and qLogEI.
 
-ZDT1, ZDT3, and DTLZ2 use 40 total evaluations per method and trial:
+## High-dimensional MORBO solvers
 
-- qLogEHVI: 5 initial + 35 BO evaluations
-- STCH: two independent runs of 5 initial + 15 BO evaluations
+### `morbo`
 
-ZDT2 uses its requested special protocol of 30 total evaluations:
+Implements the coordinated MORBO core:
 
-- qLogEHVI: 3 initial + 27 BO evaluations
-- STCH: two independent runs of 3 initial + 12 BO evaluations
+- five local trust regions by default;
+- local independent ARD Matérn-5/2 GPs;
+- initial trust-region length `0.8`, minimum `0.01`, maximum `1.6`;
+- coordinate perturbation probability `min(20 / d, 1)`;
+- local joint Thompson samples over discrete Sobol candidates;
+- greedy coordination by sampled hypervolume improvement;
+- failure tolerance `max(d / 3, 10)`;
+- trust-region contraction and restart.
 
-For every problem, all methods and trials use the same fixed hypervolume
-reference point:
+### `composite_morbo`
 
-- ZDT: `(1.1, 11.0)`
-- DTLZ2: `(2.5, 2.5)`
+Uses the same coordinated trust-region procedure, but local GPs model the
+intermediate functions. Thompson samples are passed through the objective-wise
+composition before hypervolume improvement is calculated.
 
-Larger dominated hypervolume is better.
+The implementation is sequential and captures MORBO's central trust-region,
+Thompson-sampling, HVI coordination, and restart mechanisms. It is adapted to
+the repository's `q=1`, 45-evaluation protocol; it is not a byte-for-byte copy
+of the authors' large-batch reference runner.
 
-## Plots
-
-The benchmark computes cumulative hypervolume after every function evaluation.
-Across trials, NumPy calculates the mean and standard error. Each solid curve is
-the mean, and its shaded region is mean plus or minus one standard error.
-
-Two plots are generated for every selected benchmark:
-
-- Standard qLogEHVI versus Composite qLogEHVI
-- Objective-GP STCH versus Composite STCH
-
-For example, ZDT3 produces:
+## Main exports
 
 ```text
-hypervolume_vs_evaluations_zdt3_qlogehvi.png
-hypervolume_vs_evaluations_zdt3_stch.png
+standard_mobo
+composite_mobo
+chebyshev_bo
+composite_chebyshev_bo
+spherical_chebyshev_bo
+composite_spherical_chebyshev_bo
+morbo
+composite_morbo
+simplex_weights
+smooth_tchebycheff
+ObjectivewiseComposer
+MORBOConfig
+SolverResult
 ```
 
-## Installation
+## Sources
 
-The code requires Python and the following packages:
-
-```text
-torch
-botorch
-gpytorch
-numpy
-matplotlib
-pymoo
-```
-
-Install them in a virtual environment, for example:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install torch botorch gpytorch numpy matplotlib pymoo
-```
-
-## Running experiments
-
-Run every benchmark:
-
-```powershell
-python benchmark.py
-```
-
-Run only DTLZ2:
-
-```powershell
-python benchmark.py --problems dtlz2
-```
-
-Run only ZDT3:
-
-```powershell
-python benchmark.py --problems zdt3
-```
-
-Run multiple selected problems:
-
-```powershell
-python benchmark.py --problems zdt1 zdt3 dtlz2
-```
-
-Useful flags include:
-
-```text
---trials          Number of independent trials
---budget          Total evaluations for non-ZDT2 problems
---weights         Number of scalarization weights
---temperature     Smooth-Tchebycheff temperature
---seed            Base random seed
---raw-samples     Raw acquisition-optimization samples
---restarts        Acquisition-optimization restarts
---output          Base output filename used to construct plot names
-```
-
-ZDT2's 30-evaluation and three-initial-point protocol is currently fixed in the
-benchmark code rather than controlled by `--budget` and `--initial`.
-
-## Numerical safeguards
-
-The implementation uses double precision and qLogEI/qLogEHVI for stable
-acquisition calculations. If SciPy encounters a non-finite acquisition
-gradient, the solver evaluates the acquisition on a fresh Sobol candidate set
-and selects its best finite candidate.
-
-On Windows without the MSVC compiler, the code skips BoTorch's optional fused
-C++ qLogEHVI extension and uses the equivalent pure-Python implementation.
-
-## Repository layout
-
-```text
-solvers.py             Four BO solvers and shared GP/acquisition utilities
-benchmark.py           Benchmark definitions, trials, hypervolume, and plots
-project_writeup.tex    LaTeX description of the project and results section
-README.md              Project documentation
-.gitignore             Generated and local files excluded from Git
-```
-
-## Current limitations
-
-- Only low-dimensional, two-objective synthetic tests are currently included.
-- Intermediate outputs are assumed observable at no additional evaluation cost.
-- Output GPs are independent and do not model cross-output correlations.
-- ZDT composite models use `log(g)`, while DTLZ2 models `g` directly.
-- Two scalarization weights mostly target the ends of the Pareto front.
-- Standard-error bands are descriptive and are not formal significance tests.
+- Doumont et al., *We Still Don't Understand High-Dimensional Bayesian
+  Optimization*, AISTATS 2026. Official code: https://github.com/colmont/linear-bo
+- Daulton et al., *Multi-Objective Bayesian Optimization over High-Dimensional
+  Search Spaces*, UAI 2022. Official code: https://github.com/facebookresearch/morbo
