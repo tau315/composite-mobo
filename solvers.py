@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 import shutil
 import sys
 from typing import Callable, Optional, Sequence
@@ -42,6 +43,17 @@ from gpytorch.kernels import Kernel, MaternKernel, ScaleKernel
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.means import ConstantMean
 from gpytorch.priors import GammaPrior, LogNormalPrior
+
+# `morbo/` (vendored alongside this file) is a full port of the published
+# MORBO algorithm (Daulton et al., UAI 2022), with genuine coordinated
+# parallel-batch trust-region candidate selection. `batched_morbo`/
+# `composite_batched_morbo` below drive it directly, as an alternative to
+# `morbo`/`composite_morbo`'s own from-scratch, one-point-per-iteration
+# core further down in this file.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+from morbo.run_one_replication import run_one_replication
 
 Tensor = torch.Tensor
 Evaluator = Callable[[Tensor], Tensor]
@@ -736,6 +748,157 @@ def composite_morbo(
 ) -> SolverResult:
     """MORBO with local GPs on objective-specific composite subfunctions."""
     return _morbo(
+        evaluate,
+        dim,
+        ref_point,
+        evaluate_components=evaluate_components,
+        compose=compose,
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# batched_morbo / composite_batched_morbo: same calling convention as
+# morbo/composite_morbo above, but driven by the vendored morbo/ package
+# (a full port of Daulton et al.'s published algorithm) instead of _morbo's
+# from-scratch core. The key difference: _morbo proposes and evaluates one
+# point at a time, whereas the vendored engine jointly selects a batch of
+# candidates across all trust regions per iteration, then evaluates the
+# whole batch before updating any trust region -- matching the paper's
+# actual coordinated parallel-batch selection.
+#
+# Compatibility note: the vendored morbo/ package was developed and tested
+# against botorch 0.9.5 / gpytorch 1.11. If this file's own botorch version
+# (newer, per the JIT-kernel workaround above) turns out to be incompatible
+# with morbo/'s expectations, that would surface as an import or runtime
+# error the first time one of these two functions is called.
+# ---------------------------------------------------------------------------
+
+
+def _batched_morbo(
+    evaluate: Evaluator,
+    dim: int,
+    ref_point: Tensor,
+    *,
+    n_init: int = 5,
+    n_iter: int = 40,
+    seed: int = 0,
+    config: Optional[MORBOConfig] = None,
+    batch_size: Optional[int] = None,
+    min_tr_size: Optional[int] = None,
+    evaluate_components: Optional[Evaluator] = None,
+    compose: Optional[Composer] = None,
+) -> SolverResult:
+    cfg = config or MORBOConfig()
+    ref_point_t = torch.as_tensor(ref_point, dtype=torch.double)
+    # `run_one_replication`'s `max_reference_point` is in the vendored
+    # engine's maximize convention; this file's `ref_point` (like its
+    # `evaluate` outputs) is minimize-convention, so the sign flip mirrors
+    # what `_morbo`/`dominated_hypervolume_trace` do with `ref = -ref_point`.
+    max_reference_point = (-ref_point_t).tolist()
+    # A batched engine can't reuse "one iteration = one evaluation"; by
+    # default each iteration proposes one candidate per trust region
+    # (matching the paper's per-TR batch element), evaluated jointly.
+    bs = batch_size if batch_size is not None else cfg.n_trust_regions
+    max_evals = n_init + n_iter * bs
+    # The vendored engine's own default min_tr_size (250) assumes the large
+    # init budgets its own experiments use; this file's benchmarks default
+    # to n_init=5, well under that, so pick something that always satisfies
+    # the engine's "n_initial_points > min_tr_size" requirement instead of
+    # forcing every caller to pass this explicitly.
+    mts = min_tr_size if min_tr_size is not None else max(1, min(n_init - 1, 20))
+
+    if evaluate_components is not None:
+        if compose is None:
+            raise ValueError("evaluate_components requires compose.")
+
+        def raw_evaluate_components(X: Tensor) -> Tensor:
+            return evaluate_components(X).double()
+
+        def raw_compose(H: Tensor) -> Tensor:
+            return compose(H).double()
+
+        extra = dict(
+            raw_evaluate_components=raw_evaluate_components,
+            raw_compose=raw_compose,
+        )
+    else:
+        def raw_evaluate(X: Tensor) -> Tensor:
+            return evaluate(X).double()
+
+        extra = dict(raw_evaluate=raw_evaluate)
+
+    outputs = []
+    run_one_replication(
+        seed=seed,
+        label="morbo",
+        max_evals=max_evals,
+        evalfn="Callable",
+        dim=dim,
+        batch_size=bs,
+        n_initial_points=n_init,
+        min_tr_size=mts,
+        n_trust_regions=cfg.n_trust_regions,
+        length_init=cfg.length_init,
+        length_min=cfg.length_min,
+        length_max=cfg.length_max,
+        success_streak=cfg.success_streak,
+        failure_streak=cfg.failure_streak,
+        raw_samples=cfg.raw_samples,
+        max_reference_point=max_reference_point,
+        save_callback=lambda output: outputs.append(output),
+        save_during_opt=False,
+        verbose=False,
+        **extra,
+    )
+    result = outputs[-1]
+    X = result["X_history"]
+    # `metric_history` is the raw callable's own output, recorded before the
+    # vendored engine's internal negation: for the direct-objective case
+    # that internal negation IS applied (so it's flipped back here to
+    # recover `evaluate`'s own minimize-convention values, exactly, with no
+    # extra `evaluate` calls); for the composite case the internal negation
+    # is skipped instead (the engine's own composite reduction handles it
+    # as part of composing), so `metric_history` is already the raw,
+    # minimize-convention components `evaluate_components` returned.
+    if evaluate_components is not None:
+        C = result["metric_history"]
+        Y = compose(C).double()
+        return SolverResult(X=X, Y=Y, components=C)
+    Y = -result["metric_history"]
+    return SolverResult(X=X, Y=Y)
+
+
+def batched_morbo(
+    evaluate: Evaluator, dim: int, ref_point: Tensor, **kwargs
+) -> SolverResult:
+    """Direct-objective MORBO, driven by the vendored paper-accurate engine.
+
+    Same signature as ``morbo`` above (``evaluate``, ``dim``, ``ref_point``,
+    plus ``n_init``/``n_iter``/``seed``/``config`` via ``kwargs``), with two
+    additions: an optional ``batch_size`` kwarg (default
+    ``config.n_trust_regions``, i.e. one candidate per trust region per
+    iteration) and an optional ``min_tr_size`` kwarg (default scales with
+    ``n_init``; see ``_batched_morbo``). See the section note above for why
+    ``n_iter`` means "batch iterations" here rather than "evaluations".
+    """
+    return _batched_morbo(evaluate, dim, ref_point, **kwargs)
+
+
+def composite_batched_morbo(
+    evaluate: Evaluator,
+    evaluate_components: Evaluator,
+    compose: Composer,
+    dim: int,
+    ref_point: Tensor,
+    **kwargs,
+) -> SolverResult:
+    """MORBO with local GPs on composite subfunctions, vendored engine.
+
+    Same signature as ``composite_morbo`` above, plus the same optional
+    ``batch_size``/``min_tr_size`` kwargs described in ``batched_morbo``.
+    """
+    return _batched_morbo(
         evaluate,
         dim,
         ref_point,
