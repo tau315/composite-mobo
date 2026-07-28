@@ -1,9 +1,8 @@
 """Shared experiment runner and mathematical helpers for benchmark scripts.
 
-Each benchmark lives in its own executable ``benchmark_*.py`` file.  This
-module only centralizes the experimental protocol, hypervolume calculation,
-plotting, and reusable test-function primitives so the six scripts cannot
-silently drift to different budgets or plotting conventions.
+Each benchmark lives in its own executable ``benchmark_*.py`` file. This
+module centralizes the experimental protocol, hypervolume calculation, and
+plotting so the scripts cannot silently drift to different conventions.
 """
 
 from __future__ import annotations
@@ -230,9 +229,41 @@ def _argument_parser(problem: BenchmarkProblem) -> argparse.ArgumentParser:
     )
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--initial", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=40)
-    parser.add_argument("--weights", type=int, default=8)
-    parser.add_argument("--per-weight", type=int, default=5)
+    parser.add_argument(
+        "--evaluations",
+        type=int,
+        default=50 if problem.suite == "low" else 400,
+        help=(
+            "target total expensive evaluations per method; STCH uses the "
+            "largest equal allocation across all weights that does not exceed "
+            "this target"
+        ),
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help=(
+            "override adaptive evaluations for qLogEHVI/MORBO "
+            "(default: --evaluations minus --initial)"
+        ),
+    )
+    parser.add_argument(
+        "--weights",
+        type=int,
+        default=4 if problem.suite == "low" else 10,
+        help="number of smooth-Tchebycheff scalarization weights",
+    )
+    parser.add_argument(
+        "--per-weight",
+        type=int,
+        default=10 if problem.suite == "low" else None,
+        help=(
+            "override adaptive evaluations per STCH weight "
+            "(low-dimensional default: 10; high-dimensional default: largest "
+            "equal allocation within --evaluations)"
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument(
         "--raw-samples", type=int, default=128 if problem.suite == "low" else 256
@@ -261,6 +292,7 @@ def _validate_arguments(args: argparse.Namespace) -> None:
     positive = (
         "trials",
         "initial",
+        "evaluations",
         "iterations",
         "weights",
         "per_weight",
@@ -279,6 +311,7 @@ def _validate_arguments(args: argparse.Namespace) -> None:
 def _quick_arguments(args: argparse.Namespace) -> None:
     args.trials = 1
     args.initial = 3
+    args.evaluations = 5
     args.iterations = 1
     args.weights = 2
     args.per_weight = 1
@@ -439,16 +472,14 @@ def _plot_traces(
     output: Path,
     show: bool,
 ) -> None:
-    colors = {
-        panels[0][1][0]: "#1f77b4",
-        panels[0][1][1]: "#ff7f0e",
-        panels[1][1][0]: "#1f77b4",
-        panels[1][1][1]: "#ff7f0e",
+    family_colors = {
+        panels[0][0]: "#2ca02c" if "Tchebycheff" in panels[0][0] else "#9467bd",
+        panels[1][0]: "#2ca02c" if "Tchebycheff" in panels[1][0] else "#9467bd",
     }
-    fig, axes = plt.subplots(
-        1, 2, figsize=(12.4, 4.8), constrained_layout=True, sharey=True
-    )
-    for ax, (panel_title, method_names) in zip(axes, panels):
+    fig, ax = plt.subplots(figsize=(10.8, 6.4), constrained_layout=True)
+    longest_trace = 0
+    for family_name, method_names in panels:
+        color = family_colors[family_name]
         for method_name in method_names:
             trial_values = np.stack(traces[method_name], axis=0)
             mean = trial_values.mean(axis=0)
@@ -457,8 +488,16 @@ def _plot_traces(
             else:
                 sem = np.zeros_like(mean)
             evaluations = np.arange(1, len(mean) + 1)
-            color = colors[method_name]
-            ax.plot(evaluations, mean, color=color, linewidth=2.2, label=method_name)
+            longest_trace = max(longest_trace, len(mean))
+            linestyle = ":" if "Composite" in method_name else "-"
+            ax.plot(
+                evaluations,
+                mean,
+                color=color,
+                linestyle=linestyle,
+                linewidth=2.4,
+                label=method_name,
+            )
             ax.fill_between(
                 evaluations,
                 mean - sem,
@@ -467,31 +506,32 @@ def _plot_traces(
                 alpha=0.18,
                 linewidth=0,
             )
-        ax.axvline(
-            n_initial,
-            color="#666666",
-            linestyle="--",
-            linewidth=1.0,
-            alpha=0.8,
-            label="End of initial design",
-        )
-        ax.axhline(
-            problem.plotted_max_hypervolume,
-            color="#2f2f2f",
-            linestyle=":",
-            linewidth=1.4,
-            label=(
-                f"{problem.max_hypervolume_label} = "
-                f"{problem.plotted_max_hypervolume:.4f}"
-            ),
-        )
-        ax.set_title(panel_title, pad=9)
-        ax.set_xlabel("Total function evaluations")
-        ax.grid(True, alpha=0.25)
-        ax.margins(x=0.01)
-        ax.legend(loc="lower right", frameon=False, fontsize=9)
-    axes[0].set_ylabel("Dominated hypervolume")
-    fig.suptitle(problem.name, fontsize=14)
+    ax.axvline(
+        n_initial,
+        color="#666666",
+        linestyle="--",
+        linewidth=1.0,
+        alpha=0.75,
+        label="End of initial design",
+    )
+    ax.axhline(
+        problem.plotted_max_hypervolume,
+        color="#2f2f2f",
+        linestyle="-.",
+        linewidth=1.3,
+        alpha=0.8,
+        label=(
+            f"{problem.max_hypervolume_label} = "
+            f"{problem.plotted_max_hypervolume:.4f}"
+        ),
+    )
+    ax.set_title(problem.name, fontsize=14, pad=10)
+    ax.set_xlabel("Total function evaluations")
+    ax.set_ylabel("Dominated hypervolume")
+    ax.set_xlim(1, max(longest_trace, 2))
+    ax.grid(True, alpha=0.25)
+    ax.margins(x=0.01)
+    ax.legend(loc="lower right", frameon=False, fontsize=9)
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=220, bbox_inches="tight")
     print(f"Saved plot: {output.resolve()}")
@@ -508,6 +548,10 @@ def run_benchmark(problem: BenchmarkProblem) -> None:
     args = parser.parse_args()
     if args.quick:
         _quick_arguments(args)
+    if args.iterations is None:
+        args.iterations = args.evaluations - args.initial
+    if args.per_weight is None:
+        args.per_weight = (args.evaluations - args.initial) // args.weights
     _validate_arguments(args)
     problem.validate()
 

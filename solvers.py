@@ -557,7 +557,7 @@ def _high_dim_scalarized_runs(
 def spherical_chebyshev_bo(
     evaluate: Evaluator, dim: int, weights: Tensor, ideal: Tensor, **kwargs
 ) -> SolverResult:
-    """Eight-weight STCH using five acquisitions per weight by default."""
+    """Spherical-linear STCH with caller-provided simplex weights."""
     return _high_dim_scalarized_runs(evaluate, dim, weights, ideal.double(), **kwargs)
 
 

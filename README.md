@@ -1,223 +1,353 @@
-# Composite Multi-Objective Bayesian Optimization Solvers
+# Composite Multi-Objective Bayesian Optimization
 
-This repository contains direct and composite multi-objective BO solvers plus
-six reproducible benchmark scripts. Each benchmark is defined in its own file,
-while `benchmark_common.py` keeps the trial, hypervolume, and plotting protocol
-identical across problems.
+This project tests whether exploiting known composite structure improves
+Pareto-front recovery in multi-objective Bayesian optimization (MOBO). Every
+benchmark compares a direct solver that models final objectives against a
+composite counterpart that models objective-specific intermediate functions.
 
-## Problem interface
+The implemented structure is
 
-All objectives are minimized on `[0, 1]^d`.
+$$
+f_i(x)=g_i\left(h_{i1}(x),\ldots,h_{ik_i}(x)\right).
+$$
 
-Direct solvers require:
+Each intermediate column has its own independent GP. Different objectives may
+use different numbers of intermediates. They may also use the same underlying
+physical quantity, but that quantity is repeated in the component matrix so it
+is still modeled independently for each objective.
 
-```python
-evaluate(X) -> Y                 # n x m objectives
+All solvers minimize objectives on the normalized input cube
+$[0,1]^d$. The benchmark files perform any required conversion to physical
+units.
+
+## Files
+
+The project uses five benchmark families. High-dimensional DTLZ2 is evaluated
+at two input dimensions, so there are six standalone scripts:
+
+| Script | Benchmark | Objectives | Input dimension | Suite |
+|---|---|---:|---:|---|
+| `benchmark_dtlz2.py` | DTLZ2 | 2 | 6 | Low-dimensional |
+| `benchmark_snar.py` | Summit SNAr reaction | 2 | 4 | Low-dimensional scientific |
+| `benchmark_nanoparticle_rgb.py` | RGB-selective multilayer nanoparticle | 3 | 6 | Low-dimensional scientific |
+| `benchmark_dtlz2_100d.py` | DTLZ2 | 2 | 100 | High-dimensional |
+| `benchmark_dtlz2_600d.py` | DTLZ2 | 2 | 600 | High-dimensional |
+| `benchmark_cort_tg119.py` | CORT TG119 radiotherapy | 3 | 418 | High-dimensional scientific |
+
+Shared experiment, hypervolume, and plotting code is in
+`benchmark_common.py`. All BO algorithms remain in `solvers.py`. The `morbo/`
+directory contains supporting code for the vendored batched MORBO
+implementation; the default benchmark runner uses the sequential coordinated
+MORBO implementation exported by `solvers.py`.
+
+## Installation
+
+The required Python packages are:
+
+```powershell
+python -m pip install numpy scipy matplotlib torch gpytorch botorch
 ```
 
-Composite solvers require:
+The code runs on CPU by default. A CUDA-enabled PyTorch installation can be
+used for custom extensions, but the benchmark scripts do not require a GPU.
 
-```python
-evaluate_components(X) -> H      # n x p intermediate values
-compose(H) -> Y                  # n x m objectives
-```
+## Running the benchmarks
 
-with `compose(evaluate_components(X)) == evaluate(X)`.
-
-The intended structure is objective-specific:
-
-$$
-f_i(x)=g_i\left(h_{i1}(x),\ldots,h_{ik_i}(x)\right),
-$$
-
-Each objective may use a different number of intermediate functions. Component
-groups may also overlap; every component column is modeled by its own independent
-GP, and each known outer function receives the columns assigned to that objective.
-
-Example:
-
-```python
-composer = ObjectivewiseComposer(
-    component_groups=[[0, 1], [2, 3, 4]],
-    objective_maps=[
-        lambda H1: (torch.cos(H1[..., 0]) + 1) * torch.sin(H1[..., 1]),
-        lambda H2: H2[..., 0]**2 + H2[..., 1] * H2[..., 2],
-    ],
-)
-```
-
-This represents
-
-$$
-f_1=g_1(h_{11},h_{12}),\qquad
-f_2=g_2(h_{21},h_{22},h_{23}).
-$$
-
-## Benchmark suite
-
-| Script | Problem | Components per objective | Solver comparison |
-|---|---|---|---|
-| `benchmark_dtlz2.py` | DTLZ2, 2 objectives, 6D | 2 + 2 | qLogEHVI and STCH |
-| `benchmark_ackley_griewank_6d.py` | Ackley--Griewank, 2 objectives, 6D | 2 + 2 | qLogEHVI and STCH |
-| `benchmark_five_ackley_6d.py` | Five shifted Ackley objectives, 6D | 2 each | qLogEHVI and STCH |
-| `benchmark_langermann_ackley_6d.py` | Langermann--Ackley, 2 objectives, 6D | 3 + 2 | qLogEHVI and STCH |
-| `benchmark_ackley_griewank_50d.py` | Ackley--Griewank, 2 objectives, 50D | 2 + 2 | spherical STCH and MORBO |
-| `benchmark_projected_langermann_500d.py` | Projected Langermann, 2 objectives, 500D | 4 + 5 | spherical STCH and MORBO |
-
-Running a script with no flags performs 20 independent trials and saves a
-two-panel Matplotlib PNG. Each panel contains only one direct/composite pair,
-with the trial mean as a solid line and its standard error as a shaded band.
-No CSV file is produced.
+Run any benchmark directly:
 
 ```powershell
 python benchmark_dtlz2.py
-python benchmark_ackley_griewank_6d.py
-python benchmark_five_ackley_6d.py
-python benchmark_langermann_ackley_6d.py
-python benchmark_ackley_griewank_50d.py
-python benchmark_projected_langermann_500d.py
+python benchmark_snar.py
+python benchmark_nanoparticle_rgb.py
+python benchmark_dtlz2_100d.py
+python benchmark_dtlz2_600d.py
+python benchmark_cort_tg119.py
 ```
 
-Use `--show` to open the plot after saving it. Use `--quick` only to verify an
-installation with a tiny one-trial run. Other useful overrides include
-`--trials`, `--iterations`, `--weights`, `--per-weight`, `--raw-samples`, and
-`--output`.
+Each full run uses 20 independent trials and writes one Matplotlib PNG. No CSV
+file is generated.
 
-### Fixed hypervolume reference points
+The low-dimensional target budget is 50 expensive evaluations. Direct
+qLogEHVI uses 5 initial plus 45 adaptive evaluations. STCH uses four
+scalarization weights with ten adaptive evaluations per weight: 5 shared
+initial plus $4\times10$ adaptive evaluations, or 45 total.
 
-Every objective uses the fixed reference coordinate `2.5`. Thus the reference
-is `(2.5, 2.5)` for two-objective problems and `(2.5, ..., 2.5)` for the
-five-objective problem. The same tensor is passed to the acquisition functions
-and the plotted dominated-hypervolume metric.
+The high-dimensional target budget is 400 expensive evaluations. MORBO uses 5
+initial plus 395 adaptive evaluations. Spherical STCH uses ten scalarization
+weights with the largest equal allocation inside the target: 5 initial plus
+$10\times39$ adaptive evaluations, or 395 total.
 
-DTLZ2 has the exact maximum
+These are intentionally substantial experiments, especially with 20 trials.
+Use `--quick` first to verify an installation:
 
-$$
-2.5^2-\frac{\pi}{4}=5.464602.
-$$
-
-For the normalized custom objectives, the ideal/reference box ceiling is
-`6.25` with two objectives and `97.65625` with five objectives. The custom
-ideal vectors are not jointly attainable, so these are rigorous upper bounds
-rather than exact attainable front hypervolumes. Every graph displays the
-applicable exact maximum or ceiling as a dotted horizontal line. Its two panels
-share one y-axis scale.
-
-## Standard protocol
-
-Public solvers default to:
-
-- 5 scrambled-Sobol initial evaluations;
-- 40 adaptive evaluations after initialization;
-- double-precision tensors;
-- sequential acquisition (`q=1`).
-
-Scalarization studies should create eight weights:
-
-```python
-weights = simplex_weights(8, number_of_objectives, seed=seed)
+```powershell
+python benchmark_snar.py --quick
+python benchmark_cort_tg119.py --quick
 ```
 
-Both low- and high-dimensional STCH solvers evaluate one shared five-point
-initial design, then branch into eight scalarizations. Each weight adds five
-adaptive points, for exactly
+Useful overrides include:
 
-$$
-5 + 8\times 5 = 45
-$$
+```powershell
+python benchmark_dtlz2.py --trials 5 --evaluations 30
+python benchmark_dtlz2_100d.py --trials 2 --evaluations 50
+python benchmark_snar.py --output results/snar.png --show
+```
 
-unique expensive evaluations. Scalarization branches share the initial data but
-do not use points acquired by other weights when fitting their own GP.
+Available controls include `--trials`, `--evaluations`, `--initial`,
+`--weights`, `--per-weight`, `--raw-samples`, `--restarts`, `--seed`,
+`--output`, and `--show`. `--iterations` can explicitly override the number of
+adaptive qLogEHVI or MORBO evaluations.
+
+## Plots and evaluation protocol
+
+Every graph shows dominated hypervolume versus total expensive function
+evaluations:
+
+- purple identifies qLogEHVI in low dimensions and MORBO in high dimensions;
+- green identifies smooth Tchebycheff methods;
+- solid lines are direct/objective-modeling solvers;
+- dotted lines are composite/component-modeling solvers;
+- shaded regions are one standard error over independent trials;
+- the vertical dashed line marks the end of the shared initial design;
+- the horizontal dash-dot line is the exact maximum hypervolume when known,
+  or the ideal/reference-box ceiling otherwise.
+
+Every method within one benchmark uses the same fixed reference point and the
+same initial Sobol design for a given trial seed. Trial seeds differ, so the 20
+trials have independent initial designs.
+
+Hypervolume is computed for minimization objectives. Objective vectors are
+internally negated when passed to BoTorch, which uses maximization.
 
 ## Low-dimensional solvers
 
-### `standard_mobo`
+### Direct qLogEHVI
 
-Fits an independent exact GP to every final objective and selects points with
-qLogEHVI.
+`standard_mobo` fits one exact GP to each final objective and selects the next
+point with qLogEHVI.
 
-### `composite_mobo`
+### Composite qLogEHVI
 
-Fits an independent exact GP to every intermediate function. Posterior
-component samples are passed through `compose`, and qLogEHVI is evaluated on
-the resulting objective samples.
+`composite_mobo` fits one exact GP to each intermediate function. Posterior
+component samples are passed through the known outer maps before qLogEHVI is
+calculated.
 
-### `chebyshev_bo`
+### Objective-GP STCH
 
-Fits objective GPs and applies smooth Tchebycheff scalarization inside qLogEI:
-
-$$
-S_{\tau,w}(f)=\tau\log\sum_i
-\exp\left(\frac{w_i(f_i-z_i^\star)}{\tau}\right).
-$$
-
-### `composite_chebyshev_bo`
-
-Fits component GPs and evaluates
+`chebyshev_bo` fits final-objective GPs. For weight vector $w$ and ideal point
+$z^\star$, it minimizes the smooth Tchebycheff scalarization
 
 $$
--S_{\tau,w}\left(g_1(h_1),\ldots,g_m(h_m)\right)
+S_{\tau,w}(f)
+=
+\tau\log\left[
+\sum_i
+\exp\left(
+\frac{w_i(f_i-z_i^\star)}{\tau}
+\right)
+\right].
+$$
+
+The acquisition function is qLogEI applied to the negative scalarization.
+
+### Composite STCH
+
+`composite_chebyshev_bo` models intermediate functions and evaluates
+
+$$
+-S_{\tau,w}\left(
+g_1(h_1),\ldots,g_m(h_m)
+\right)
 $$
 
 inside qLogEI.
 
-## High-dimensional spherical-linear solvers
+## High-dimensional solvers
 
-These use the model from Doumont et al., *We Still Don't Understand
-High-Dimensional Bayesian Optimization*.
+### Spherical objective STCH
 
-Inputs are centered, divided by ARD scales and a decoupled global scale, then
-mapped by inverse stereographic projection:
+`spherical_chebyshev_bo` maps normalized inputs through inverse stereographic
+projection and fits spherical-linear GPs to final objectives before applying
+STCH.
+
+### Spherical composite STCH
+
+`composite_spherical_chebyshev_bo` uses the same spherical-linear model but
+fits the intermediate functions and applies the known outer maps before
+scalarization.
+
+### MORBO
+
+`morbo` uses multiple coordinated local trust regions, local ARD
+Matérn-5/2 GPs, Thompson-sampled candidate sets, hypervolume-improvement
+coordination, trust-region expansion/contraction, and restarts.
+
+### Composite MORBO
+
+`composite_morbo` uses the same trust-region logic but fits local GPs to the
+intermediates. Thompson samples are composed into objective values before
+hypervolume improvement is calculated.
+
+## Benchmark definitions
+
+### DTLZ2
+
+For two objectives and $d$ inputs,
 
 $$
-P(z)=\frac{[2z,\|z\|^2-1]}{1+\|z\|^2}.
+g(x)=\sum_{j=2}^{d}(x_j-0.5)^2,
 $$
 
-The kernel is
+$$
+f_1(x)=(1+g(x))\cos\left(\frac{\pi x_1}{2}\right),
+\qquad
+f_2(x)=(1+g(x))\sin\left(\frac{\pi x_1}{2}\right).
+$$
+
+The component matrix repeats $g$ so the two objective-specific groups are
 
 $$
-k(x,x')=b_0+b_1P(z)^\top P(z'),\qquad b_0+b_1=1,
+h_1(x)=\left(g(x),\cos(\pi x_1/2)\right),
+\qquad
+h_2(x)=\left(g(x),\sin(\pi x_1/2)\right).
 $$
 
-with simplex coefficients, the paper's DSP-like unscaled ARD prior, a constant
-mean, and its bounded-noise log-normal likelihood.
+The Pareto front satisfies $f_1^2+f_2^2=1$ in the positive quadrant.
 
-### `spherical_chebyshev_bo`
+The 6D reference point is $(2.5,2.5)$ and its exact maximum hypervolume is
+$5.464602$. Canonical DTLZ2 values away from the front grow with dimension, so
+the high-dimensional reference coordinates dominate the full input domains:
 
-Fits spherical-linear GPs to final objectives, then applies STCH and qLogEI.
+| Dimension | Reference coordinate | Exact maximum HV |
+|---:|---:|---:|
+| 100 | 25.85 | 667.437102 |
+| 600 | 150.85 | 22754.937102 |
 
-### `composite_spherical_chebyshev_bo`
+### Summit SNAr reaction
 
-Fits spherical-linear GPs to objective-specific intermediate functions, then
-applies the known outer maps, STCH, and qLogEI.
+The four physical variables are residence time, pyrrolidine equivalents, inlet
+concentration, and temperature. A vectorized RK4 integrator evaluates the
+published five-species plug-flow kinetic model used by
+[Summit](https://gosummit.readthedocs.io/en/latest/_modules/summit/benchmarks/snar.html).
 
-## High-dimensional MORBO solvers
+The objectives are maximizing space-time yield and minimizing E-factor. They
+are converted to normalized minimization objectives:
 
-### `morbo`
+$$
+f_1=1-\frac{\operatorname{STY}}{13000},
+\qquad
+f_2=\frac{E}{500}.
+$$
 
-Implements the coordinated MORBO core:
+The STY group models product outlet concentration and total flow. The E-factor
+group independently models all five outlet concentrations and total flow. The
+known mass-balance equations compose these quantities into the two objectives.
 
-- five local trust regions by default;
-- local independent ARD Matérn-5/2 GPs;
-- initial trust-region length `0.8`, minimum `0.01`, maximum `1.6`;
-- coordinate perturbation probability `min(20 / d, 1)`;
-- local joint Thompson samples over discrete Sobol candidates;
-- greedy coordination by sampled hypervolume improvement;
-- failure tolerance `max(d / 3, 10)`;
-- trust-region contraction and restart.
+The fixed reference point is $(2.5,2.5)$ and the displayed ideal-box ceiling
+is $6.25$.
 
-### `composite_morbo`
+### RGB-selective multilayer nanoparticle
 
-Uses the same coordinated trust-region procedure, but local GPs model the
-intermediate functions. Thompson samples are passed through the objective-wise
-composition before hypervolume improvement is calculated.
+The input contains six layer thicknesses in $[30,70]$ nm. The script implements
+the 201-wavelength Mie-scattering simulator from the
+[DeepBO nanoparticle study](https://arxiv.org/abs/2104.11667).
 
-The implementation is sequential and captures MORBO's central trust-region,
-Thompson-sampling, HVI coordination, and restart mechanisms. It is adapted to
-the repository's `q=1`, 45-evaluation protocol; it is not a byte-for-byte copy
-of the authors' large-batch reference runner.
+The three target bands are blue $[400,500)$ nm, green $[500,600)$ nm, and red
+$[600,700)$ nm. For each band $c$,
 
-## Main exports
+$$
+I_c(x)=\sum_{\lambda\in c}\sigma(\lambda;x),
+\qquad
+O_c(x)=\sum_{\lambda\notin c}\sigma(\lambda;x),
+$$
+
+$$
+f_c(x)=\frac{O_c(x)}{I_c(x)+O_c(x)}.
+$$
+
+Each objective therefore has two independently modeled components,
+$h_c=(I_c,O_c)$. Minimizing $f_c$ is equivalent to maximizing the corresponding
+in-band/out-of-band selectivity ratio.
+
+The fixed reference point is $(2.5,2.5,2.5)$ and the displayed ideal-box
+ceiling is $15.625$.
+
+### CORT TG119 radiotherapy
+
+The public [CORT dataset](https://gigadb.org/dataset/100110) supplies sparse
+dose-influence matrices for five beam angles, 418 beamlet controls, 7,429
+target voxels, 1,280 core/OAR voxels, and 599,440 body voxels. The script
+downloads the approximately 25 MB TG119 archive on first use into
+the user cache (`%LOCALAPPDATA%\composite_mobo\cort_tg119` on Windows).
+
+To use an existing extracted copy instead:
+
+```powershell
+$env:CORT_TG119_DIR = "C:\path\to\TG119"
+python benchmark_cort_tg119.py
+```
+
+For normalized beamlet controls $x\in[0,1]^{418}$, physical fluence is $70x$
+and voxel dose is
+
+$$
+d(x)=D(70x).
+$$
+
+The three objective-specific component groups are
+
+$$
+h_T=(D_{95}^{T},D_2^{T}),\qquad
+h_C=(\overline d_C,D_2^C),\qquad
+h_N=(\overline d_N,D_2^N).
+$$
+
+They compose target coverage/hotspot penalty, core exposure, and normal-tissue
+exposure:
+
+$$
+\tilde f_T=
+[1-D_{95}^{T}]_+^2
++\frac14[D_2^{T}-1.05]_+^2,
+$$
+
+$$
+\tilde f_C=\frac12\overline d_C+\frac12D_2^C,
+\qquad
+\tilde f_N=\frac12\overline d_N+\frac12D_2^N.
+$$
+
+Each value is divided by a fixed domain upper scale computed from the
+all-maximum-fluence plan. This keeps all three objectives on comparable scales
+without changing Pareto dominance.
+
+The fixed reference point is $(2.5,2.5,2.5)$ and the displayed ideal-box
+ceiling is $15.625$.
+
+## Solver interface
+
+A direct benchmark supplies:
+
+```python
+evaluate(X) -> Y
+```
+
+A composite benchmark additionally supplies:
+
+```python
+evaluate_components(X) -> H
+compose(H) -> Y
+```
+
+The runner validates that
+
+```python
+compose(evaluate_components(X)) == evaluate(X)
+```
+
+on a Sobol probe before starting any trials.
+
+## Main exports from `solvers.py`
 
 ```text
 standard_mobo
@@ -235,9 +365,11 @@ MORBOConfig
 SolverResult
 ```
 
-## Sources
+## Algorithm sources
 
 - Doumont et al., *We Still Don't Understand High-Dimensional Bayesian
-  Optimization*, AISTATS 2026. Official code: https://github.com/colmont/linear-bo
-- Daulton et al., *Multi-Objective Bayesian Optimization over High-Dimensional
-  Search Spaces*, UAI 2022. Official code: https://github.com/facebookresearch/morbo
+  Optimization*, AISTATS 2026:
+  <https://github.com/colmont/linear-bo>
+- Daulton et al., *Multi-Objective Bayesian Optimization over
+  High-Dimensional Search Spaces*, UAI 2022:
+  <https://github.com/facebookresearch/morbo>

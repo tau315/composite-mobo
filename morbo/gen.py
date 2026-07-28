@@ -17,8 +17,13 @@ from botorch.acquisition.multi_objective.monte_carlo import (
 from botorch.models.deterministic import GenericDeterministicModel
 from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.sampling import IIDNormalSampler, SobolQMCNormalSampler
-from botorch.sampling.deterministic import DeterministicSampler
-from botorch.utils.gp_sampling import get_gp_samples
+try:
+    from botorch.sampling.deterministic import DeterministicSampler
+except ModuleNotFoundError:
+    # BoTorch >= 0.16 removed the dedicated deterministic sampler. A
+    # StochasticSampler is equivalent here because the posterior below comes
+    # from GenericDeterministicModel and therefore has no sampling variance.
+    from botorch.sampling import StochasticSampler as DeterministicSampler
 from botorch.utils.multi_objective.pareto import is_non_dominated
 from botorch.utils.multi_objective.box_decompositions.box_decomposition import (
     BoxDecomposition,
@@ -251,6 +256,14 @@ def TS_select_batch_MORBO(trbo_state: TRBOState) -> CandidateSelectionOutput:
 
             # TODO: Make num_rff_features a hyperparameter of TuRBO
             if use_rffs:
+                try:
+                    from botorch.utils.gp_sampling import get_gp_samples
+                except ModuleNotFoundError as error:
+                    raise RuntimeError(
+                        "Simple random-Fourier-feature MORBO sampling requires "
+                        "the legacy botorch.utils.gp_sampling module. Disable "
+                        "use_simple_rff with current BoTorch releases."
+                    ) from error
                 models = [model] if not isinstance(model, ModelListGP) else model.models
                 sample_model = get_gp_samples(
                     model=model,
