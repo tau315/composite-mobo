@@ -35,6 +35,8 @@ Every benchmark is a standalone script:
 | `benchmark_cort_tg119.py` | CORT TG119 radiotherapy | 3 | 418 | High-dimensional scientific |
 | `benchmark_rcm40.py` | RCM40 optimal power flow | 2 | 34 | High-dimensional scientific |
 | `benchmark_rcm46.py` | RCM46 optimal power flow | 4 | 34 | High-dimensional scientific |
+| `benchmark_photonic.py` | Photonic-crystal complete bandgap | 2 | 1024 | High-dimensional scientific |
+| `benchmark_topopt.py` | SIMP topology optimization, half-MBB beam | 2 | 1152 | High-dimensional scientific |
 
 Shared experiment, hypervolume, and plotting code is in
 `benchmark_common.py`. All BO algorithms remain in `solvers.py`. The `morbo/`
