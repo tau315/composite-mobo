@@ -10,14 +10,36 @@ ENV="${ENV:-$HOME/composite-mobo/env}"
 SBATCH="${SBATCH:-sbatch}"
 REPO_ARCHIVE_SHA256="${REPO_ARCHIVE_SHA256:-}"
 readonly COMMIT RUN REPO_ARCHIVE ENV SBATCH REPO_ARCHIVE_SHA256
-readonly -a PROBLEMS=(zdt1 zdt2 zdt3 dtlz2)
-readonly -a METHODS=(
-  standard_qlogehvi
+# Benchmarks to run, as module stems. Each contributes TRIALS x 4 array tasks.
+readonly -a BENCHMARKS=(
+  benchmark_dtlz2
+  benchmark_snar
+  benchmark_nanoparticle_rgb
+  benchmark_penicillin
+)
+# Method keys are fixed by `_solver_jobs` in benchmark_common.py: one set per
+# suite. `--list-methods` on any benchmark prints the set it will use.
+readonly -a LOW_METHODS=(
+  direct_qlogehvi
   composite_qlogehvi
   objective_gp_stch
   composite_stch
 )
-readonly TRIALS=20 TASK_COUNT=320
+readonly -a HIGH_METHODS=(
+  spherical_objective_stch
+  spherical_composite_stch
+  morbo
+  composite_morbo
+)
+readonly -a HIGH_BENCHMARKS=(
+  benchmark_dtlz2_100d
+  benchmark_dtlz2_600d
+  benchmark_cort_tg119
+  benchmark_rcm40
+  benchmark_rcm46
+)
+readonly TRIALS=20
+readonly TASK_COUNT=$((${#BENCHMARKS[@]} * TRIALS * 4))
 
 [[ -f "$REPO_ARCHIVE" ]] || { echo "Archive not found: $REPO_ARCHIVE" >&2; exit 2; }
 if [[ -n "${MAX_CONCURRENT:-}" && ! "${MAX_CONCURRENT}" =~ ^[1-9][0-9]*$ ]]; then
@@ -29,10 +51,14 @@ mkdir -p "$RUN"/{repo,logs,metadata,output}
 tasks_tmp="$RUN/tasks.tsv.tmp"
 : > "$tasks_tmp"
 task_id=0
-for problem in "${PROBLEMS[@]}"; do
+for benchmark in "${BENCHMARKS[@]}"; do
+  methods=("${LOW_METHODS[@]}")
+  for high in "${HIGH_BENCHMARKS[@]}"; do
+    [[ "$benchmark" == "$high" ]] && methods=("${HIGH_METHODS[@]}")
+  done
   for ((trial = 0; trial < TRIALS; trial++)); do
-    for method in "${METHODS[@]}"; do
-      printf '%d\t%s\t%d\t%s\n' "$task_id" "$problem" "$trial" "$method" >> "$tasks_tmp"
+    for method in "${methods[@]}"; do
+      printf '%d\t%s\t%d\t%s\n' "$task_id" "$benchmark" "$trial" "$method" >> "$tasks_tmp"
       ((task_id += 1))
     done
   done
@@ -110,27 +136,19 @@ export COMPOSITE_MOBO_COMMIT="$COMMIT"
 
 task=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$RUN/tasks.tsv")
 [[ -n "$task" ]] || { echo "No task for index $SLURM_ARRAY_TASK_ID" >&2; exit 2; }
-IFS=$'\t' read -r task_id problem trial method <<< "$task"
+IFS=$'\t' read -r task_id benchmark trial method <<< "$task"
 [[ "$task_id" == "$SLURM_ARRAY_TASK_ID" ]]
 
 cd "$RUN/repo"
-python benchmark.py \
-  --problems "$problem" \
-  --dim 6 \
+python "${benchmark}.py" \
   --trials 20 \
   --trial "$trial" \
   --method "$method" \
-  --budget 40 \
-  --initial 5 \
-  --weights 2 \
-  --temperature 0.05 \
   --seed 0 \
-  --raw-samples 128 \
-  --restarts 8 \
-  --mc-samples 512 \
   --results-dir "$RUN/output/results"
 
-artifact="$RUN/output/results/$problem/$method/trial$trial.json"
+slug=$(python -c "import $benchmark; print($benchmark.PROBLEM.slug)")
+artifact="$RUN/output/results/$slug/$method/trial$trial.json"
 python - "$artifact" <<'PY'
 import json
 import sys
@@ -159,72 +177,80 @@ export COMPOSITE_MOBO_COMMIT="$COMMIT"
 cd "$RUN/repo"
 
 python - "$RUN/tasks.tsv" "$RUN/output/results" "$RUN/output/timing_fallback_summary.json" <<'PY'
-from argparse import Namespace
+import importlib
 import json
 from pathlib import Path
 import sys
 
-import benchmark
+import benchmark_common
 
 tasks_path, results_dir, summary_path = map(Path, sys.argv[1:])
 rows = [line.split("\t") for line in tasks_path.read_text(encoding="utf-8").splitlines()]
-args = Namespace(
-    problems=("zdt1", "zdt2", "zdt3", "dtlz2"),
-    trials=20,
-    results_dir=results_dir,
-    dim=6,
-    budget=40,
-    initial=5,
-    weights=2,
-    temperature=0.05,
-    seed=0,
-    raw_samples=128,
-    restarts=8,
-    mc_samples=512,
-)
+
+
+def parsed_args(module):
+    """Reproduce exactly the settings the array tasks ran with."""
+
+    parser = benchmark_common._argument_parser(module.PROBLEM)
+    args = parser.parse_args(
+        ["--trials", "20", "--seed", "0", "--results-dir", str(results_dir)]
+    )
+    if args.iterations is None:
+        args.iterations = args.evaluations - args.initial
+    if args.per_weight is None:
+        args.per_weight = (args.evaluations - args.initial) // args.weights
+    return args
+
+
+modules = {}
 bad = []
 payloads = []
 for expected_index, row in enumerate(rows):
     if len(row) != 4 or row[0] != str(expected_index):
         bad.append(str(expected_index))
         continue
-    _, problem, trial_text, method = row
+    _, benchmark_name, trial_text, method = row
     trial = int(trial_text)
-    path = results_dir / problem / method / f"trial{trial}.json"
-    payload = benchmark._validated_payload(
-        path, benchmark._job_config(args, problem, trial)
+    if benchmark_name not in modules:
+        modules[benchmark_name] = importlib.import_module(benchmark_name)
+    module = modules[benchmark_name]
+    problem = module.PROBLEM
+    args = parsed_args(module)
+    path = results_dir / problem.slug / method / f"trial{trial}.json"
+    payload = benchmark_common._validated_payload(
+        path,
+        problem,
+        benchmark_common._job_config(problem, args, args.seed + 10_007 * trial),
+        allow_foreign_metadata=True,
     )
     if payload is None:
         bad.append(str(expected_index))
     else:
         payloads.append(payload)
-if len(rows) != 320:
-    bad.extend(
-        str(index)
-        for index in range(min(len(rows), 320), max(len(rows), 320))
-    )
 if bad:
     print("bad/retry indices: " + ",".join(dict.fromkeys(bad)))
     raise SystemExit(1)
 print("bad/retry indices: none")
-traces = benchmark.load_traces(args)
-labels = set(benchmark.METHOD_LABELS.values())
+
 incompatible = []
-for problem in args.problems:
-    methods = traces.get(problem, {})
-    if set(methods) != labels or any(
-        trace.shape[0] != args.trials for trace in methods.values()
+for benchmark_name, module in modules.items():
+    args = parsed_args(module)
+    _, panels = benchmark_common._solver_jobs(module.PROBLEM, args, args.seed)
+    expected_labels = {name for _, names in panels for name in names}
+    traces = benchmark_common.load_traces(module.PROBLEM, args, panels)
+    if set(traces) != expected_labels or any(
+        len(trace_list) != args.trials for trace_list in traces.values()
     ):
-        incompatible.append(problem)
+        incompatible.append(benchmark_name)
 if incompatible:
     print("incomplete paired trials: " + ",".join(incompatible))
     raise SystemExit(1)
-print("paired trials: 20 per family/problem")
+print("paired trials: 20 per family/benchmark")
 summary = {
     "artifacts": len(payloads),
     "timing_totals_seconds": {
         key: sum(payload["timing"][key] for payload in payloads)
-        for key in benchmark.RESULT_TIMING_KEYS
+        for key in benchmark_common.RESULT_TIMING_KEYS
     },
     "acquisition_fallbacks": {
         "total": sum(payload["acquisition_fallbacks"] for payload in payloads),
@@ -237,21 +263,16 @@ summary_path.write_text(
 )
 PY
 
-python benchmark.py \
-  --problems zdt1 zdt2 zdt3 dtlz2 \
-  --dim 6 \
-  --trials 20 \
-  --budget 40 \
-  --initial 5 \
-  --weights 2 \
-  --temperature 0.05 \
-  --seed 0 \
-  --raw-samples 128 \
-  --restarts 8 \
-  --mc-samples 512 \
-  --results-dir "$RUN/output/results" \
-  --summary-only \
-  --output "$RUN/output/hypervolume.png"
+while IFS=$'\t' read -r _ benchmark _ _; do
+  echo "$benchmark"
+done < "$RUN/tasks.tsv" | sort -u | while read -r benchmark; do
+  python "${benchmark}.py" \
+    --trials 20 \
+    --seed 0 \
+    --results-dir "$RUN/output/results" \
+    --summary-only \
+    --output "$RUN/output/hypervolume_$benchmark.png"
+done
 
 tar -czf "$RUN/composite-mobo-$COMMIT.tgz" -C "$RUN" \
   output tasks.tsv metadata run.env setup.sbatch array.sbatch aggregate.sbatch job_ids.tsv logs

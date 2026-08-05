@@ -1,421 +1,428 @@
-# Composite-Function Multi-Objective Bayesian Optimization
+# Composite Multi-Objective Bayesian Optimization
 
-This project tests whether exploiting a known composite objective structure can
-improve sample efficiency in low-dimensional, multi-objective Bayesian
-optimization (MOBO).
+This project tests whether exploiting known composite structure improves
+Pareto-front recovery in multi-objective Bayesian optimization (MOBO). Every
+benchmark compares a direct solver that models final objectives against a
+composite counterpart that models objective-specific intermediate functions.
 
-The central comparison is between learning final objectives directly,
-
-$$
-\mathbf{x}\longrightarrow \bigl(f_1(\mathbf{x}),f_2(\mathbf{x})\bigr),
-$$
-
-and learning an observable inner response before applying a known outer map,
+The implemented structure is
 
 $$
-\mathbf{x}\longrightarrow h(\mathbf{x})
-\longrightarrow
-\Phi\bigl(h(\mathbf{x}),\mathbf{x}\bigr)
-=\bigl(f_1(\mathbf{x}),f_2(\mathbf{x})\bigr).
+f_i(x)=g_i\left(h_{i1}(x),\ldots,h_{ik_i}(x)\right).
 $$
 
-The benchmark measures Pareto-front recovery using dominated hypervolume versus
-the total number of expensive function evaluations.
+Each intermediate column has its own independent GP. Different objectives may
+use different numbers of intermediates. They may also use the same underlying
+physical quantity, but that quantity is repeated in the component matrix so it
+is still modeled independently for each objective.
 
-## Methods
+All solvers minimize objectives on the normalized input cube
+$[0,1]^d$. The benchmark files perform any required conversion to physical
+units.
 
-Four solvers are implemented in `solvers.py`.
+## Files
 
-Artifacts and worker commands use these stable method keys:
+Every benchmark is a standalone script:
 
-| Method key | Plot label |
-| --- | --- |
-| `standard_qlogehvi` | Standard qLogEHVI |
-| `composite_qlogehvi` | Composite qLogEHVI |
-| `objective_gp_stch` | Objective-GP STCH |
-| `composite_stch` | Composite STCH |
+| Script | Benchmark | Objectives | Input dimension | Suite |
+|---|---|---:|---:|---|
+| `benchmark_dtlz2.py` | DTLZ2 | 2 | 6 | Low-dimensional |
+| `benchmark_snar.py` | Summit SNAr reaction | 2 | 4 | Low-dimensional scientific |
+| `benchmark_nanoparticle_rgb.py` | RGB-selective multilayer nanoparticle | 3 | 6 | Low-dimensional scientific |
+| `benchmark_penicillin.py` | Penicillin fed-batch fermentation | 3 | 7 | Low-dimensional scientific |
+| `benchmark_dtlz2_100d.py` | DTLZ2 | 2 | 100 | High-dimensional |
+| `benchmark_dtlz2_600d.py` | DTLZ2 | 2 | 600 | High-dimensional |
+| `benchmark_cort_tg119.py` | CORT TG119 radiotherapy | 3 | 418 | High-dimensional scientific |
+| `benchmark_rcm40.py` | RCM40 optimal power flow | 2 | 34 | High-dimensional scientific |
+| `benchmark_rcm46.py` | RCM46 optimal power flow | 4 | 34 | High-dimensional scientific |
 
-### Standard qLogEHVI
-
-`standard_mobo` fits one independent Gaussian process to each final objective.
-It selects new points with BoTorch's numerically stable
-`qLogExpectedHypervolumeImprovement` acquisition function.
-
-### Composite qLogEHVI
-
-`composite_mobo` fits Gaussian processes to observable intermediate responses.
-Monte Carlo component-posterior samples are passed through the known objective
-composition, and qLogEHVI is evaluated on the resulting non-Gaussian objective
-samples.
-
-Known quantities such as a candidate coordinate `x1` remain exact and are not
-given artificial GP uncertainty.
-
-### Objective-GP smooth Tchebycheff BO
-
-`chebyshev_bo` fits the final objectives directly. For each preference weight,
-posterior objective samples are transformed using
-
-$$
-S_{\tau,\mathbf{w}}(\mathbf{f})
-=\tau\log\sum_i
-\exp\left(\frac{w_i(f_i-z_i^\star)}{\tau}\right).
-$$
-
-Because the benchmarks are minimization problems, the acquisition utility is
-`-S`. A separate qLogEI run is performed for each weight.
-
-### Composite smooth Tchebycheff BO
-
-`composite_chebyshev_bo` models the intermediate responses and propagates their
-posterior samples through both the known objective map and smooth Tchebycheff
-scalarization:
-
-$$
-\mathbf{x}\rightarrow h(\mathbf{x})
-\rightarrow\mathbf{f}(\mathbf{x})
-\rightarrow S_{\tau,\mathbf{w}}(\mathbf{f}(\mathbf{x})).
-$$
-
-This is the fully nested composite method.
-
-## Benchmarks
-
-`benchmark.py` provides four deterministic, unconstrained benchmark problems.
-All inputs are bounded to `[0, 1]^d`; the default dimension is six.
-
-### ZDT1, ZDT2, and ZDT3
-
-The ZDT problems share
-
-$$
-g(\mathbf{x})=1+\frac{9}{d-1}\sum_{j=2}^{d}x_j,
-\qquad f_1(\mathbf{x})=x_1.
-$$
-
-The direct methods fit GPs to `f1` and `f2`. The composite methods fit one GP
-to the radius-like component
-
-$$
-r(\mathbf{x})=\sqrt{g(\mathbf{x})-1}
-$$
-
-and reconstruct $g=1+r^2$. Squaring keeps posterior samples in the valid
-$g\geq1$ domain. This is not the same prior as placing a GP directly on $g$.
-
-- ZDT1 has a continuous convex Pareto front.
-- ZDT2 has a continuous non-convex Pareto front.
-- ZDT3 has a disconnected Pareto front and uses the componentwise ideal point
-  $(0,-0.7733690123)$ for STCH.
-
-### DTLZ2
-
-For two objectives and six inputs,
-
-$$
-g(\mathbf{x})=\sum_{j=2}^{6}(x_j-0.5)^2,
-$$
-
-$$
-f_1=(1+g)\cos(\pi x_1/2),
-\qquad
-f_2=(1+g)\sin(\pi x_1/2).
-$$
-
-The direct methods fit GPs to `f1` and `f2`. The composite methods fit one GP
-to $r=\sqrt{g}$, reconstruct $g=r^2$, and use the exact candidate coordinate
-`x1` in the known outer map. The Pareto front is the positive quadrant of the
-unit circle.
-
-## Experimental protocol
-
-The default experiment uses:
-
-- 20 independent trials
-- Trial seeds `0, 1, ..., 19`
-- Matched seeds for corresponding direct and composite methods
-- Scrambled Sobol initial designs
-- Two scalarization weights: `(0.05, 0.95)` and `(0.95, 0.05)`
-- Smooth-Tchebycheff temperature `0.05`
-- Ideal point `(0, 0)`, except ZDT3's `(0, -0.7733690123)`
-- 128 raw acquisition samples and 8 optimization restarts
-- 512 explicitly seeded posterior Monte Carlo samples per acquisition
-
-Every problem uses five initial points per solver run. The total accounting is:
-
-| Problems | qLogEHVI artifact | STCH artifact |
-| --- | --- | --- |
-| ZDT1, ZDT3, DTLZ2 | 5 initial + 35 BO = 40 | 2 independent weights x (5 initial + 15 BO) = 40 |
-| ZDT2 | 5 initial + 25 BO = 30 | 2 independent weights x (5 initial + 10 BO) = 30 |
-
-An expensive direct-objective or component evaluation counts once; applying a
-known composition does not add an evaluation. STCH artifacts interleave the two
-weight runs by local evaluation index, so their pooled initial-design boundary
-is 10 evaluations. Corresponding direct and composite methods use matched
-seeds, initial designs, weights, per-weight seeds, and posterior-sampler seeds.
-Posterior-sampler seeds use separate trial and weight strides, so paired methods
-share streams within a trial without reusing them across trials.
-
-For every problem, all methods and trials use the same fixed hypervolume
-reference point:
-
-- ZDT: `(1.1, 11.0)`
-- DTLZ2: `(2.5, 2.5)`
-
-Larger dominated hypervolume is better.
-
-## Measurements and plots
-
-The benchmark computes cumulative dominated hypervolume after every function
-evaluation. Resume validation requires the exact current Python, package, and
-git provenance; full numeric configuration; path identity; deterministic
-problem outputs, components, weights, and run IDs; and freshly recomputed
-cumulative hypervolume. A trial contributes only when both artifacts also have
-matching provenance and family-appropriate initial designs: five rows for
-qLogEHVI and the first ten interleaved rows for two-weight STCH. Curves are the
-mean across those paired trials; shading is mean plus or minus one standard
-error.
-
-The two controlled comparisons hold the acquisition family fixed:
-
-- `standard_qlogehvi` versus `composite_qlogehvi`
-- `objective_gp_stch` versus `composite_stch`
-
-Comparisons across qLogEHVI and STCH are descriptive only: the acquisition
-rules and STCH's pooled independent weight runs differ. The standard-error
-bands are also descriptive, not formal significance tests.
-
-For example, ZDT3 produces:
-
-```text
-hypervolume_vs_evaluations_zdt3_qlogehvi.png
-hypervolume_vs_evaluations_zdt3_stch.png
-```
+Shared experiment, hypervolume, and plotting code is in
+`benchmark_common.py`. All BO algorithms remain in `solvers.py`. The `morbo/`
+directory contains supporting code for the vendored batched MORBO
+implementation; the default benchmark runner uses the sequential coordinated
+MORBO implementation exported by `solvers.py`.
 
 ## Installation
 
-The code requires Python and the following packages:
-
-```text
-torch
-botorch
-gpytorch
-numpy
-matplotlib
-pymoo
-```
-
-Install them in a virtual environment, for example:
+The required Python packages are:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install torch botorch gpytorch numpy matplotlib pymoo
+python -m pip install numpy scipy matplotlib torch gpytorch botorch
 ```
 
-## Running experiments
+The code runs on CPU by default. A CUDA-enabled PyTorch installation can be
+used for custom extensions, but the benchmark scripts do not require a GPU.
 
-Run every benchmark:
+## Running the benchmarks
+
+Run any benchmark directly:
 
 ```powershell
-python benchmark.py
+python benchmark_dtlz2.py
+python benchmark_snar.py
+python benchmark_nanoparticle_rgb.py
+python benchmark_dtlz2_100d.py
+python benchmark_dtlz2_600d.py
+python benchmark_cort_tg119.py
 ```
 
-Run only DTLZ2:
+Each full run uses 20 independent trials and writes one Matplotlib PNG. No CSV
+file is generated.
+
+The low-dimensional target budget is 50 expensive evaluations. Direct
+qLogEHVI uses 5 initial plus 45 adaptive evaluations. STCH uses four
+scalarization weights with ten adaptive evaluations per weight: 5 shared
+initial plus $4\times10$ adaptive evaluations, or 45 total.
+
+The high-dimensional target budget is 400 expensive evaluations. MORBO uses 5
+initial plus 395 adaptive evaluations. Spherical STCH uses ten scalarization
+weights with the largest equal allocation inside the target: 5 initial plus
+$10\times39$ adaptive evaluations, or 395 total.
+
+These are intentionally substantial experiments, especially with 20 trials.
+Use `--quick` first to verify an installation:
 
 ```powershell
-python benchmark.py --problems dtlz2
+python benchmark_snar.py --quick
+python benchmark_cort_tg119.py --quick
 ```
 
-Run only ZDT3:
+Useful overrides include:
 
 ```powershell
-python benchmark.py --problems zdt3
+python benchmark_dtlz2.py --trials 5 --evaluations 30
+python benchmark_dtlz2_100d.py --trials 2 --evaluations 50
+python benchmark_snar.py --output results/snar.png --show
 ```
 
-Run multiple selected problems:
+Available controls include `--trials`, `--evaluations`, `--initial`,
+`--weights`, `--per-weight`, `--raw-samples`, `--restarts`, `--seed`,
+`--output`, and `--show`. `--iterations` can explicitly override the number of
+adaptive qLogEHVI or MORBO evaluations.
 
-```powershell
-python benchmark.py --problems zdt1 zdt3 dtlz2
-```
+## Resumable artifacts
 
-Run one independently schedulable worker job:
+Every solver run writes one JSON artifact to
+`--results-dir/<benchmark slug>/<method key>/trial<N>.json` (default
+`results/`). Rerunning a benchmark revalidates each artifact and skips the runs
+that are already complete, so an interrupted 20-trial experiment resumes rather
+than restarting. Writes are atomic: an artifact is written to a temporary file
+and renamed, so a killed process never leaves a half-written result behind.
 
-```powershell
-python benchmark.py --problems zdt1 --trial 0 --method composite_qlogehvi
-```
+Method keys are stable slugs of the plot labels. `--list-methods` prints the
+set a benchmark will use:
 
-One job is one `(problem, trial, method)` run and writes one artifact to
-`results/{problem}/{method}/trial{trial}.json`. A worker selected with `--trial`
-or `--method` does not plot. Re-running a command resumes automatically: a
-complete artifact with the exact requested configuration is reported as
-`resumed` and skipped only when its recorded provenance still matches the
-current run.
-
-Failures do not stop sibling jobs. The failed artifact records a traceback in
-`failed`; after all selected siblings finish, the command exits nonzero if any
-job failed. Because failed artifacts are not resume-valid, re-running the same
-command retries them. Writes are atomic.
-
-Regenerate summaries and pairwise plots from valid artifacts without running
-optimization:
-
-```powershell
-python benchmark.py --problems zdt1 --summary-only
-```
-
-Useful flags include:
-
-```text
---trials          Number of independent trials
---trial           One zero-based trial worker
---method          One stable method-key worker
---budget          Total evaluations for non-ZDT2 problems (default: 40)
---initial         Initial points per solver run (fixed at 5)
---weights         Number of scalarization weights
---temperature     Smooth-Tchebycheff temperature
---seed            Base random seed
---raw-samples     Raw acquisition-optimization samples
---restarts        Acquisition-optimization restarts
---mc-samples      Posterior Monte Carlo samples (default: 512)
---results-dir     Artifact root directory
---summary-only    Read artifacts and plot without running jobs
---output          Base output filename used to construct plot names
-```
-
-ZDT2's 30-evaluation budget is fixed in the benchmark code rather than
-controlled by `--budget`; its initial count remains the global fixed value of
-five.
-
-### Unicorn 320-task run
-
-`run_unicorn.sh` submits the production matrix as 4 problems x 4 stable method
-keys x 20 trials = 320 independent Slurm array tasks. Each worker uses five
-initial points, two STCH weights, temperature 0.05, seed base 0, 128 raw
-starts, 8 restarts, and 512 MC samples. `benchmark.py` remains the single owner
-of the budget protocol: 40 evaluations normally and 30 for ZDT2.
-
-Create the exact source archive locally and copy it with the launcher to the
-Unicorn login node:
-
-```bash
-COMMIT=$(git rev-parse HEAD)
-git archive --format=tar.gz --output "composite-mobo-$COMMIT-src.tgz" "$COMMIT"
-sha256sum "composite-mobo-$COMMIT-src.tgz"
-scp run_unicorn.sh "composite-mobo-$COMMIT-src.tgz" \
-  <netid>@unicorn-login-01.coecis.cornell.edu:
-```
-
-Cornell VPN is required before SSH when off campus. On the login node, choose
-an NFS-backed `RUN` path; do not use node-local scratch. The launcher only
-writes run files and submits jobs there. Conda creation, package installation,
-and the full test suite run inside the scheduled setup job.
-
-```bash
-export COMMIT=<exact-commit-sha>
-export RUN=$HOME/composite-mobo/runs/$COMMIT-$(date +%Y%m%d-%H%M%S)
-export REPO_ARCHIVE=$HOME/composite-mobo-$COMMIT-src.tgz
-export REPO_ARCHIVE_SHA256=<sha256-from-local-machine>
-bash run_unicorn.sh
-```
-
-`ENV` defaults to `$HOME/composite-mobo/env`, so all jobs share one pinned
-Python 3.12 environment. By default the array is unthrottled (`0-319`) and
-Slurm applies site/account limits. Set `MAX_CONCURRENT` to a positive integer
-only when an explicit cap is needed:
-
-```bash
-MAX_CONCURRENT=32 bash run_unicorn.sh
-```
-
-| Stage | Slurm request | Dependency |
-| --- | --- | --- |
-| Setup | `default_partition`, 2 CPUs, 8 GB, 1 hour, requeue | none |
-| 320-worker array | `default_partition`, 1 CPU, 4 GB, 4 hours, requeue | setup `afterok` |
-| Aggregate | `default_partition`, 1 CPU, 4 GB, 1 hour, requeue | array `afterany` |
-
-The aggregate job validates all 320 artifacts and all 20 compatible trial pairs
-per method family, writes eight pairwise PNGs and
-`output/timing_fallback_summary.json`, then creates
-`$RUN/composite-mobo-$COMMIT.tgz`. Retrieve that archive from the login node:
-
-```bash
-scp <netid>@unicorn-login-01.coecis.cornell.edu:\
-~/composite-mobo/runs/<run>/composite-mobo-$COMMIT.tgz .
-```
-
-Workers write atomically, and strict-current resume skips already valid
-artifacts. If aggregation prints `bad/retry indices`, resubmit only that comma-
-separated index list, then schedule aggregation after the retry array:
-
-```bash
-BAD=3,41,207
-retry=$(sbatch --parsable --array="$BAD" \
-  --output="$RUN/logs/retry-%A_%a.out" --error="$RUN/logs/retry-%A_%a.err" \
-  "$RUN/array.sbatch" "$RUN/run.env")
-retry=${retry%%;*}
-sbatch --dependency="afterany:$retry" \
-  --output="$RUN/logs/aggregate-retry-%j.out" \
-  --error="$RUN/logs/aggregate-retry-%j.err" \
-  "$RUN/aggregate.sbatch" "$RUN/run.env"
-```
-
-### Artifact fields
-
-Each schema-version-2 JSON artifact records the problem, stable method key,
-trial, seed, full configuration, Python/package/git metadata, evaluated `X`
-and `Y`, optional composite components, optional STCH weights and run IDs,
-cumulative `hypervolume`, per-observation `wall_seconds`, aggregate `timing`,
-the nonnegative integer `acquisition_fallbacks` count, and `failed` state.
-
-For initial points, `wall_seconds` repeats the initial batch time divided by
-the number of points. Each BO entry is that iteration's wall time. STCH values
-are interleaved across weight runs in the same order as `X` and `Y`.
-
-| Timing key | Meaning |
+| Suite | Method keys |
 | --- | --- |
-| `initial_design_seconds` | Scrambled Sobol initial-design generation |
-| `initial_evaluate_seconds` | Initial direct-objective or component oracle calls |
-| `initial_compose_seconds` | Known composite map on initial components; zero for direct methods |
-| `gp_fit_seconds` | All GP fits during BO |
-| `acquisition_build_seconds` | Acquisition and supporting-object construction |
-| `acquisition_optimize_seconds` | Acquisition optimization |
-| `bo_evaluate_seconds` | Sequential direct-objective or component oracle calls |
-| `bo_compose_seconds` | Known composite map after BO evaluations; zero for direct methods |
-| `solver_total_seconds` | End-to-end solver time, including solver overhead |
-| `hypervolume_seconds` | Post-solver cumulative-hypervolume calculation |
-| `total_seconds` | Runner time through solver, hypervolume, and evaluation-count check, excluding artifact serialization |
+| Low-dimensional | `direct_qlogehvi`, `composite_qlogehvi`, `objective_gp_stch`, `composite_stch` |
+| High-dimensional | `spherical_objective_stch`, `spherical_composite_stch`, `morbo`, `composite_morbo` |
 
-Phase values are accumulated across the whole artifact, including both STCH
-weight runs. They are subsets of the total timers rather than values to add to
-`total_seconds`. `acquisition_fallbacks` is a diagnostic count, not a duration.
+Resume is deliberately strict. An artifact is only reused when it re-derives
+exactly: schema version, benchmark slug and path identity, the full numeric
+configuration, Python/package/git provenance, and freshly recomputed
+components, objectives, scalarization weights, run IDs, and cumulative
+hypervolume. Anything that fails is treated as absent and simply rerun, so a
+stale or partially corrupt result can never contaminate a figure.
 
-## Numerical safeguards
+A failing run is recorded, not swallowed: its artifact stores the traceback,
+its siblings still run, and the process exits non-zero at the end with a count
+of the failures.
 
-The implementation uses double precision and qLogEI/qLogEHVI for stable
-acquisition calculations. If SciPy encounters a non-finite acquisition
-gradient, the solver evaluates the acquisition on a fresh Sobol candidate set
-and selects its best finite candidate. Each use increments the artifact's
-`acquisition_fallbacks` count; continuous `optimize_acqf` remains the primary
-path.
+`--trial` and `--method` restrict a process to a single run, which is what lets
+one experiment fan out across a cluster array. A worker writes its artifact and
+stops without plotting; `--summary-only` later plots from whatever is on disk
+without running any solver.
 
-On Windows without the MSVC compiler, the code skips BoTorch's optional fused
-C++ qLogEHVI extension and uses the equivalent pure-Python implementation.
-
-## Repository layout
-
-```text
-solvers.py             Four BO solvers and shared GP/acquisition utilities
-benchmark.py           Benchmark definitions, trials, hypervolume, and plots
-README.md              Project documentation
-.gitignore             Generated and local files excluded from Git
+```powershell
+python benchmark_dtlz2.py --list-methods
+python benchmark_dtlz2.py --trial 0 --method composite_stch --results-dir results
+python benchmark_dtlz2.py --summary-only --results-dir results
 ```
 
-## Current limitations
+Artifacts also carry per-run timing: `solvers.TIMING_KEYS` phase totals
+(initial design, expensive evaluations, composition, GP fitting, acquisition
+construction and optimization), a wall-clock figure per expensive evaluation,
+and a count of acquisition-optimizer fallbacks. `run_unicorn.sh` submits the
+whole experiment as a Slurm array of single-run workers plus an aggregation
+step that revalidates every artifact and writes a timing/fallback summary.
 
-- Only low-dimensional, two-objective synthetic tests are currently included.
-- Intermediate outputs are assumed observable at no additional evaluation cost.
-- Output GPs are independent and do not model cross-output correlations.
-- Composite component transforms induce different priors than modeling `g`
-  directly.
-- Two scalarization weights mostly target the ends of the Pareto front.
+## Plots and evaluation protocol
+
+Every graph shows dominated hypervolume versus total expensive function
+evaluations:
+
+- purple identifies qLogEHVI in low dimensions and MORBO in high dimensions;
+- green identifies smooth Tchebycheff methods;
+- solid lines are direct/objective-modeling solvers;
+- dotted lines are composite/component-modeling solvers;
+- shaded regions are one standard error over independent trials;
+- the vertical dashed line marks the end of the shared initial design;
+- the horizontal dash-dot line is the exact maximum hypervolume when known,
+  or the ideal/reference-box ceiling otherwise.
+
+Every method within one benchmark uses the same fixed reference point and the
+same initial Sobol design for a given trial seed. Trial seeds differ, so the 20
+trials have independent initial designs.
+
+A trial only enters a curve when both members of its comparison pair produced
+valid artifacts that agree on configuration, provenance, scalarization weights,
+and initial design. A pair that cannot satisfy that is dropped from the figure
+rather than plotted against a mismatched partner.
+
+Hypervolume is computed for minimization objectives. Objective vectors are
+internally negated when passed to BoTorch, which uses maximization.
+
+## Low-dimensional solvers
+
+### Direct qLogEHVI
+
+`standard_mobo` fits one exact GP to each final objective and selects the next
+point with qLogEHVI.
+
+### Composite qLogEHVI
+
+`composite_mobo` fits one exact GP to each intermediate function. Posterior
+component samples are passed through the known outer maps before qLogEHVI is
+calculated.
+
+### Objective-GP STCH
+
+`chebyshev_bo` fits final-objective GPs. For weight vector $w$ and ideal point
+$z^\star$, it minimizes the smooth Tchebycheff scalarization
+
+$$
+S_{\tau,w}(f)
+=
+\tau\log\left[
+\sum_i
+\exp\left(
+\frac{w_i(f_i-z_i^\star)}{\tau}
+\right)
+\right].
+$$
+
+The acquisition function is qLogEI applied to the negative scalarization.
+
+### Composite STCH
+
+`composite_chebyshev_bo` models intermediate functions and evaluates
+
+$$
+-S_{\tau,w}\left(
+g_1(h_1),\ldots,g_m(h_m)
+\right)
+$$
+
+inside qLogEI.
+
+## High-dimensional solvers
+
+### Spherical objective STCH
+
+`spherical_chebyshev_bo` maps normalized inputs through inverse stereographic
+projection and fits spherical-linear GPs to final objectives before applying
+STCH.
+
+### Spherical composite STCH
+
+`composite_spherical_chebyshev_bo` uses the same spherical-linear model but
+fits the intermediate functions and applies the known outer maps before
+scalarization.
+
+### MORBO
+
+`morbo` uses multiple coordinated local trust regions, local ARD
+Matérn-5/2 GPs, Thompson-sampled candidate sets, hypervolume-improvement
+coordination, trust-region expansion/contraction, and restarts.
+
+### Composite MORBO
+
+`composite_morbo` uses the same trust-region logic but fits local GPs to the
+intermediates. Thompson samples are composed into objective values before
+hypervolume improvement is calculated.
+
+## Benchmark definitions
+
+### DTLZ2
+
+For two objectives and $d$ inputs,
+
+$$
+g(x)=\sum_{j=2}^{d}(x_j-0.5)^2,
+$$
+
+$$
+f_1(x)=(1+g(x))\cos\left(\frac{\pi x_1}{2}\right),
+\qquad
+f_2(x)=(1+g(x))\sin\left(\frac{\pi x_1}{2}\right).
+$$
+
+The component matrix repeats $g$ so the two objective-specific groups are
+
+$$
+h_1(x)=\left(g(x),\cos(\pi x_1/2)\right),
+\qquad
+h_2(x)=\left(g(x),\sin(\pi x_1/2)\right).
+$$
+
+The Pareto front satisfies $f_1^2+f_2^2=1$ in the positive quadrant.
+
+The 6D reference point is $(2.5,2.5)$ and its exact maximum hypervolume is
+$5.464602$. Canonical DTLZ2 values away from the front grow with dimension, so
+the high-dimensional reference coordinates dominate the full input domains:
+
+| Dimension | Reference coordinate | Exact maximum HV |
+|---:|---:|---:|
+| 100 | 25.85 | 667.437102 |
+| 600 | 150.85 | 22754.937102 |
+
+### Summit SNAr reaction
+
+The four physical variables are residence time, pyrrolidine equivalents, inlet
+concentration, and temperature. A vectorized RK4 integrator evaluates the
+published five-species plug-flow kinetic model used by
+[Summit](https://gosummit.readthedocs.io/en/latest/_modules/summit/benchmarks/snar.html).
+
+The objectives are maximizing space-time yield and minimizing E-factor. They
+are converted to normalized minimization objectives:
+
+$$
+f_1=1-\frac{\operatorname{STY}}{13000},
+\qquad
+f_2=\frac{E}{500}.
+$$
+
+The STY group models product outlet concentration and total flow. The E-factor
+group independently models all five outlet concentrations and total flow. The
+known mass-balance equations compose these quantities into the two objectives.
+
+The fixed reference point is $(2.5,2.5)$ and the displayed ideal-box ceiling
+is $6.25$.
+
+### RGB-selective multilayer nanoparticle
+
+The input contains six layer thicknesses in $[30,70]$ nm. The script implements
+the 201-wavelength Mie-scattering simulator from the
+[DeepBO nanoparticle study](https://arxiv.org/abs/2104.11667).
+
+The three target bands are blue $[400,500)$ nm, green $[500,600)$ nm, and red
+$[600,700)$ nm. For each band $c$,
+
+$$
+I_c(x)=\sum_{\lambda\in c}\sigma(\lambda;x),
+\qquad
+O_c(x)=\sum_{\lambda\notin c}\sigma(\lambda;x),
+$$
+
+$$
+f_c(x)=\frac{O_c(x)}{I_c(x)+O_c(x)}.
+$$
+
+Each objective therefore has two independently modeled components,
+$h_c=(I_c,O_c)$. Minimizing $f_c$ is equivalent to maximizing the corresponding
+in-band/out-of-band selectivity ratio.
+
+The fixed reference point is $(2.5,2.5,2.5)$ and the displayed ideal-box
+ceiling is $15.625$.
+
+### CORT TG119 radiotherapy
+
+The public [CORT dataset](https://gigadb.org/dataset/100110) supplies sparse
+dose-influence matrices for five beam angles, 418 beamlet controls, 7,429
+target voxels, 1,280 core/OAR voxels, and 599,440 body voxels. The script
+downloads the approximately 25 MB TG119 archive on first use into
+the user cache (`%LOCALAPPDATA%\composite_mobo\cort_tg119` on Windows).
+
+To use an existing extracted copy instead:
+
+```powershell
+$env:CORT_TG119_DIR = "C:\path\to\TG119"
+python benchmark_cort_tg119.py
+```
+
+For normalized beamlet controls $x\in[0,1]^{418}$, physical fluence is $70x$
+and voxel dose is
+
+$$
+d(x)=D(70x).
+$$
+
+The three objective-specific component groups are
+
+$$
+h_T=(D_{95}^{T},D_2^{T}),\qquad
+h_C=(\overline d_C,D_2^C),\qquad
+h_N=(\overline d_N,D_2^N).
+$$
+
+They compose target coverage/hotspot penalty, core exposure, and normal-tissue
+exposure:
+
+$$
+\tilde f_T=
+[1-D_{95}^{T}]_+^2
++\frac14[D_2^{T}-1.05]_+^2,
+$$
+
+$$
+\tilde f_C=\frac12\overline d_C+\frac12D_2^C,
+\qquad
+\tilde f_N=\frac12\overline d_N+\frac12D_2^N.
+$$
+
+Each value is divided by a fixed domain upper scale computed from the
+all-maximum-fluence plan. This keeps all three objectives on comparable scales
+without changing Pareto dominance.
+
+The fixed reference point is $(2.5,2.5,2.5)$ and the displayed ideal-box
+ceiling is $15.625$.
+
+## Solver interface
+
+A direct benchmark supplies:
+
+```python
+evaluate(X) -> Y
+```
+
+A composite benchmark additionally supplies:
+
+```python
+evaluate_components(X) -> H
+compose(H) -> Y
+```
+
+The runner validates that
+
+```python
+compose(evaluate_components(X)) == evaluate(X)
+```
+
+on a Sobol probe before starting any trials.
+
+## Main exports from `solvers.py`
+
+```text
+standard_mobo
+composite_mobo
+chebyshev_bo
+composite_chebyshev_bo
+spherical_chebyshev_bo
+composite_spherical_chebyshev_bo
+morbo
+composite_morbo
+simplex_weights
+smooth_tchebycheff
+ObjectivewiseComposer
+MORBOConfig
+SolverResult
+```
+
+## Algorithm sources
+
+- Doumont et al., *We Still Don't Understand High-Dimensional Bayesian
+  Optimization*, AISTATS 2026:
+  <https://github.com/colmont/linear-bo>
+- Daulton et al., *Multi-Objective Bayesian Optimization over
+  High-Dimensional Search Spaces*, UAI 2022:
+  <https://github.com/facebookresearch/morbo>

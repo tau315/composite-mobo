@@ -55,13 +55,18 @@ esac
     assert completed.returncode == 0, completed.stdout + completed.stderr
     tasks = [line.split("\t") for line in (run / "tasks.tsv").read_text().splitlines()]
     expected = [
-        [str(index), problem, str(trial), method]
-        for index, (problem, trial, method) in enumerate(
+        [str(index), benchmark, str(trial), method]
+        for index, (benchmark, trial, method) in enumerate(
             product(
-                ("zdt1", "zdt2", "zdt3", "dtlz2"),
+                (
+                    "benchmark_dtlz2",
+                    "benchmark_snar",
+                    "benchmark_nanoparticle_rgb",
+                    "benchmark_penicillin",
+                ),
                 range(20),
                 (
-                    "standard_qlogehvi",
+                    "direct_qlogehvi",
                     "composite_qlogehvi",
                     "objective_gp_stch",
                     "composite_stch",
@@ -114,21 +119,16 @@ esac
     assert "#SBATCH --time=04:00:00" in array
     for name in ("OMP", "MKL", "OPENBLAS", "NUMEXPR"):
         assert f"export {name}_NUM_THREADS=1" in array
-    for option in (
-        "--dim 6", "--trials 20", "--budget 40", "--initial 5", "--weights 2",
-        "--temperature 0.05", "--seed 0", "--raw-samples 128", "--restarts 8",
-        "--mc-samples 512",
-    ):
+    for option in ("--trials 20", "--seed 0"):
         assert option in array
         assert option in aggregate
+    assert "--trial " in array and "--method " in array
     assert "COMPOSITE_MOBO_COMMIT" in array
     assert "_validated_payload" in aggregate
     assert "load_traces" in aggregate
     assert "paired trials" in aggregate
-    assert "shape[0] != args.trials" in aggregate
+    assert "len(trace_list) != args.trials" in aggregate
     assert "--summary-only" in aggregate
-    assert "min(len(rows), 320)" in aggregate
-    assert "max(len(rows), 320)" in aggregate
     assert "composite-mobo-$COMMIT.tgz" in aggregate
     assert not any(word in launcher.lower() for word in ("api_key", "password", "secret"))
 
