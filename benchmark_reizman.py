@@ -30,9 +30,14 @@ from reizman_emulator import ReizmanEmulator
 
 EMULATOR = ReizmanEmulator(case=4, catalyst="P1-L2")
 DIM = 3
+# Normalization constants, chosen as conservative bounds rather than attained
+# maxima. The emulator's own reachable extremes are lower -- roughly 96.6% yield,
+# and turnover about 149.6 at (445 s, 103 C, 0.5 mol%), where yield is only 75%.
+# Naively combining the domain bounds gives 100/0.5 = 200, which no design
+# achieves because maximum yield and minimum loading do not coincide. These
+# constants only set the objective scale; the comparison is unaffected by them,
+# and the reference point below is what bounds the measured hypervolume.
 MAX_YIELD = 100.0
-# The published domain bound for turnover number, and exactly the largest value
-# reachable: 100% yield at the 0.5 mol% minimum loading.
 MAX_TURNOVER = 200.0
 LOADING_INDEX = 2
 
