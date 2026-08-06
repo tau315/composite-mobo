@@ -15,7 +15,7 @@ def _bash():
     return "bash"
 
 
-def test_launcher_writes_the_320_task_run_contract(tmp_path):
+def test_launcher_writes_the_160_task_run_contract(tmp_path):
     archive = tmp_path / "repo.tgz"
     archive.write_bytes(b"test archive")
     sbatch_log = tmp_path / "sbatch.log"
@@ -65,8 +65,6 @@ esac
                 (
                     "benchmark_reizman",
                     "benchmark_snar",
-                    "benchmark_nanoparticle_rgb",
-                    "benchmark_penicillin",
                 ),
                 range(20),
                 (
@@ -79,7 +77,7 @@ esac
         )
     ]
     assert tasks == expected
-    assert len({tuple(task[1:]) for task in tasks}) == 320
+    assert len({tuple(task[1:]) for task in tasks}) == 160
     assert (run / "job_ids.tsv").read_text().splitlines() == [
         "stage\tjob_id",
         "setup\t101",
@@ -87,7 +85,7 @@ esac
         "aggregate\t103",
     ]
     submissions = sbatch_log.read_text().splitlines()
-    assert any("--array=0-319" in line.split() for line in submissions)
+    assert any("--array=0-159" in line.split() for line in submissions)
     # ... and that a concurrency cap, when asked for, rides on the same flag.
     capped = subprocess.run(
         [_bash(), LAUNCHER.as_posix()],
@@ -99,7 +97,7 @@ esac
     )
     assert capped.returncode == 0, capped.stdout + capped.stderr
     assert any(
-        "--array=0-319%100" in line.split()
+        "--array=0-159%100" in line.split()
         for line in sbatch_log.read_text().splitlines()
     )
     assert any("--dependency=afterok:101" in line for line in submissions)
