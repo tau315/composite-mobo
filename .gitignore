@@ -55,3 +55,6 @@ paper/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Scratch space for probes and delegated-search output
+tmp/
