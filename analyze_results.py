@@ -16,12 +16,16 @@ prefix. STCH is compared at its endpoint, where every weight has run.
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 import sys
 
 import numpy as np
 from scipy import stats
+import torch
+
+from benchmark_common import dominated_hypervolume_trace
 
 PAIRS = (
     ("qLogEHVI", "direct_qlogehvi", "composite_qlogehvi", True),
@@ -30,22 +34,80 @@ PAIRS = (
 ANYTIME_BUDGETS = (7, 10, 15, 20, 30)
 
 
+def _problem_for(slug: str):
+    """The benchmark module whose PROBLEM carries this slug, if it still exists."""
+
+    for path in sorted(Path(".").glob("benchmark_*.py")):
+        if path.stem == "benchmark_common":
+            continue
+        problem = getattr(importlib.import_module(path.stem), "PROBLEM", None)
+        if problem is not None and problem.slug == slug:
+            return problem
+    return None
+
+
+def _payloads(root: Path, slug: str, method: str, trials: int) -> list[dict]:
+    return [
+        json.loads((root / slug / method / f"trial{t}.json").read_text())
+        for t in range(trials)
+    ]
+
+
 def _traces(root: Path, slug: str, method: str, trials: int) -> np.ndarray:
-    return np.array(
-        [
-            json.loads((root / slug / method / f"trial{t}.json").read_text())[
-                "hypervolume"
-            ]
-            for t in range(trials)
-        ]
-    )
+    return np.array([p["hypervolume"] for p in _payloads(root, slug, method, trials)])
+
+
+def _check_comparable(root: Path, slug: str, methods: tuple[str, ...], trials: int) -> None:
+    """Refuse to compare artifacts that did not come from one campaign.
+
+    The stored hypervolume depends on the reference point, the budget, and the
+    commit, none of which appear in the trace itself. Reading a directory that
+    mixes them silently produces a plausible-looking table of nonsense -- the
+    reason this check exists is that it happened: a stale directory reported
+    SNAr hypervolumes near 5.93 under a reference point whose box maximum is
+    1.155.
+    """
+
+    seen: dict[str, set] = {"config": set(), "commit": set()}
+    for method in methods:
+        for payload in _payloads(root, slug, method, trials):
+            # Seed legitimately varies per trial; everything else must not.
+            config = {k: v for k, v in payload["config"].items() if k != "seed"}
+            seen["config"].add(json.dumps(config, sort_keys=True))
+            seen["commit"].add(payload["metadata"]["git_commit"])
+    if len(seen["config"]) > 1:
+        raise SystemExit(
+            f"{slug}: artifacts disagree on configuration; they are not one campaign"
+        )
+    if len(seen["commit"]) > 1:
+        raise SystemExit(
+            f"{slug}: artifacts come from {len(seen['commit'])} different commits"
+        )
+
+    # The stored trace depends on the reference point, which the config does not
+    # record, so recompute one trace against the current benchmark. This is the
+    # check that catches a directory written before the reference was retuned.
+    problem = _problem_for(slug)
+    if problem is None:
+        return
+    payload = _payloads(root, slug, methods[0], 1)[0]
+    Y = torch.tensor(payload["Y"], dtype=torch.double)
+    expected = dominated_hypervolume_trace(Y, problem.ref_point)
+    if not np.allclose(expected, payload["hypervolume"], rtol=1e-9, atol=1e-9):
+        raise SystemExit(
+            f"{slug}: stored hypervolume does not match the current benchmark "
+            f"(reference point {problem.ref_point.tolist()}); these artifacts are stale"
+        )
 
 
 def _compare(direct: np.ndarray, composite: np.ndarray) -> dict:
     """Paired statistics at one budget. Wilcoxon is the primary test."""
 
     delta = 100.0 * (composite.mean() - direct.mean()) / abs(direct.mean())
-    identical = np.allclose(direct, composite)
+    # Only exactly-zero paired differences make a Wilcoxon test undefined.
+    # Treating merely-close arrays as identical discards real results: a
+    # synthetic pair passing np.allclose still had a true p-value of 1.9e-06.
+    identical = bool(np.array_equal(direct, composite))
     return {
         "direct": direct.mean(),
         "direct_sem": direct.std(ddof=1) / np.sqrt(len(direct)),
@@ -74,9 +136,15 @@ def main() -> None:
     for slug in sorted(p.name for p in root.iterdir() if p.is_dir()):
         print(f"=== {slug} ===")
         for family, direct_key, composite_key, sequential in PAIRS:
+            _check_comparable(root, slug, (direct_key, composite_key), trials)
             direct = _traces(root, slug, direct_key, trials)
             composite = _traces(root, slug, composite_key, trials)
             budget = direct.shape[1]
+            if composite.shape[1] != budget:
+                raise SystemExit(
+                    f"{slug} {family}: arms used {budget} and {composite.shape[1]} "
+                    "evaluations; they are not a matched comparison"
+                )
             print(f"  {family} (budget {budget})")
             print(_line("final", _compare(direct[:, -1], composite[:, -1])))
             if not sequential:

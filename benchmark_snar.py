@@ -137,7 +137,11 @@ def evaluate_components(X: torch.Tensor) -> torch.Tensor:
     outlet = _outlet_concentrations(
         residence_time, equivalents, inlet_concentration, temperature
     )
-    return outlet.clamp_min(CONCENTRATION_FLOOR).log()
+    # log(c + floor) rather than log(max(c, floor)): the shifted form is smooth
+    # and strictly monotone, so a fully consumed species becomes a gentle
+    # approach to log(floor) instead of a censored plateau that a GP would have
+    # to fit as a flat region with a hard edge.
+    return (outlet + CONCENTRATION_FLOOR).log()
 
 
 def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
@@ -153,7 +157,7 @@ def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
 
     # Components are log concentrations; exp is positive by construction, so
     # the E-factor denominator can never cross zero.
-    outlet = H[..., :5].exp()
+    outlet = (H[..., :5].exp() - CONCENTRATION_FLOOR).clamp_min(0.0)
     product = outlet[..., PRODUCT_INDEX]
     sty = (
         6.0e4
@@ -190,14 +194,21 @@ PROBLEM = BenchmarkProblem(
     evaluate_components=evaluate_components,
     compose=compose,
     ideal=torch.zeros(2, dtype=torch.double),
-    # Just past the worst attainable corner. Over a 4096-point Sobol sweep the
-    # objectives span [0.18, 1.00] and [0.017, 1.05], so the previous (2.5, 2.5)
-    # credited every method with a large constant slab no design can reach: 78%
-    # of the reported hypervolume was already present after five random points.
-    # Tightening it drops that to 43%, which is what the measurement is actually
-    # about. It does not change any paired comparison -- both arms share an
-    # initial design, so a common offset cancels in every paired difference --
-    # but it stops the headline number from being mostly free volume.
+    # Chosen to bound the Pareto-relevant region rather than the whole feasible
+    # image. The previous (2.5, 2.5) credited every method with a large slab no
+    # design can reach: 78% of the reported hypervolume was already present after
+    # five random points, against 43% here.
+    #
+    # This does *not* leave paired comparisons unchanged, and an earlier version
+    # of this comment wrongly said it did. Moving the reference alters each
+    # trial's hypervolume non-uniformly, and qLogEHVI also consumes the reference
+    # when it builds its acquisition, so a rerun follows a different trajectory.
+    # Results computed under different reference points are not comparable.
+    #
+    # One corner does exceed it: X=(1,1,1,1) gives (0.997, 1.695). That design is
+    # badly dominated -- the approximate Pareto front's nadir is (0.762, 0.018) --
+    # so it never contributes to the measured hypervolume, but the reference is a
+    # bound on the region of interest, not on every attainable point.
     ref_point=torch.tensor([1.05, 1.10], dtype=torch.double),
 )
 

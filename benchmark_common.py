@@ -618,11 +618,10 @@ def _argument_parser(problem: BenchmarkProblem) -> argparse.ArgumentParser:
     parser.add_argument(
         "--per-weight",
         type=int,
-        default=10 if problem.suite == "low" else None,
+        default=None,
         help=(
-            "override adaptive evaluations per STCH weight "
-            "(low-dimensional default: 10; high-dimensional default: largest "
-            "equal allocation within --evaluations)"
+            "override adaptive evaluations per STCH weight (default: the "
+            "largest equal allocation that fits inside --evaluations)"
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.05)
