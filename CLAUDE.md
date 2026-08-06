@@ -40,9 +40,20 @@ python diagnose_composite.py --demo                      # self-check
 touching the runner. A full default run is 20 trials and is genuinely expensive
 (low-dim 50 evaluations, high-dim 400, times 4 methods).
 
-Cluster runs go through `run_unicorn.sh` (Slurm array of single-run workers plus
-an aggregation step). The login host is `unicorn-login-01.coecis.cornell.edu`
-via `~/.ssh/uni.sh`; it needs the Cornell VPN and times out without it.
+Cluster runs go through `run_unicorn.sh` (a Slurm array of single-run workers
+plus an aggregation step), submitted from the login node. To drive the cluster
+from a laptop:
+
+```bash
+scripts/unicorn.sh 'sinfo'                       # any remote command
+git bundle create - HEAD | scripts/unicorn.sh 'cat > ~/repo.bundle'
+```
+
+That wrapper uses SSH key authentication only and refuses password fallback, so
+a missing key fails loudly instead of hanging. Host, user, and key path are
+overridable via `UNICORN_HOST` / `UNICORN_USER` / `UNICORN_KEY`; the private key
+is the one thing that deliberately lives outside the repo. Cornell VPN is
+required — without it the host times out rather than refusing.
 
 ## Architecture
 

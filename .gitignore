@@ -3,7 +3,6 @@
 .codex/
 .codex-work/
 .claude/
-codex-use.md
 
 # Python bytecode and caches
 __pycache__/
@@ -46,7 +45,10 @@ benchmark_results*.csv
 *.run.xml
 *.synctex.gz
 *.toc
-paper/
+# Paper working files: the outline and format notes are ours and belong in
+# the repo; the reference PDF and the NeurIPS template zip are third-party.
+paper/*
+!paper/*.md
 
 
 # IDE and OS files

@@ -1,0 +1,4 @@
+# Local development installs exactly what the cluster campaign installs, so a
+# result reproduced on a laptop and one produced by run_unicorn.sh come from the
+# same stack.
+-r requirements-cluster.txt

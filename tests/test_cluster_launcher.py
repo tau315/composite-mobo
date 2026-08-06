@@ -136,6 +136,7 @@ esac
 def test_cluster_requirements_are_exactly_pinned():
     assert (ROOT / "requirements-cluster.txt").read_text().splitlines() == [
         "numpy==2.3.3",
+        "scipy==1.15.2",
         "torch==2.12.0",
         "botorch==0.18.0",
         "gpytorch==1.15.2",
