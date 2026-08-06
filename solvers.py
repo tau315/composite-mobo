@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 import inspect
 import math
 import os
-import shutil
 import sys
 from time import perf_counter
 from typing import Callable, Optional, Sequence
@@ -90,13 +89,21 @@ def _timed(timing, key, fn, *args):
     return value
 
 
-# BoTorch 0.18 tries to JIT-build an optional fused qLogEHVI kernel. On Windows
-# without the MSVC compiler this produces a long subprocess traceback before
-# correctly falling back to the identical pure-Python calculation. Select that
-# fallback up front. This private sentinel can be removed once BoTorch exposes a
-# public switch for disabling the optional extension.
-if sys.platform == "win32" and shutil.which("cl") is None:
-    _multi_objective_logei._load_attempted = True
+# BoTorch 0.18 tries to JIT-build an optional fused qLogEHVI kernel on first use.
+# Always select the identical pure-Python fallback instead, for two reasons.
+#
+# On Windows without MSVC the build produces a long subprocess traceback before
+# falling back anyway. On a heterogeneous Slurm cluster it is worse than noisy:
+# the kernel is compiled by whichever node happens to run first, cached in a
+# shared home directory, and then loaded by every other node -- so an older CPU
+# dies with SIGILL ("Illegal instruction"). Even where it does load, having some
+# workers on the fused path and others on the fallback would make their results
+# disagree, and resume validation recomputes objectives to 1e-12.
+#
+# The fallback is the same calculation, so the only cost is a marginal speedup
+# we do not need. This private sentinel can go once BoTorch exposes a public
+# switch for the optional extension.
+_multi_objective_logei._load_attempted = True
 
 
 @dataclass
