@@ -212,25 +212,39 @@ Two transforms are worth calling out because they are choices, not physics:
 - **`q = V / tau` is computed from `x` and never modelled.** It is exact, and
   routing it through `g` is worth +45.8% on the yield objective by itself.
 
-#### Would a large constant multiplier work instead of the log?
+#### Would constant scaling of the concentrations work instead of the log?
 
-No, and not by a small margin -- it cannot work at all. Modelling `K * c` and
-dividing `K` back out inside `g` gives results identical to four significant
-figures for every `K` tried:
+No — and not approximately, but exactly not. Scaling each species by its own
+constant, `c_i -> K_i c_i`, and dividing the `K_i` back out inside `g` reproduces
+the unscaled result to four significant figures for every choice tried:
 
-| representation | advantage | f1 | f2 |
+| representation | advantage | f1 (yield) | f2 (E-factor) |
 |---|---:|---:|---:|
-| `log(c)` (as shipped) | **27.0%** | 31.7% | **25.4%** |
-| `c x 1` | 15.3% | 45.8% | 0.2% |
-| `c x 100` | 15.3% | 45.8% | 0.2% |
-| `c x 10,000` | 15.3% | 45.8% | 0.2% |
-| `c x 1,000,000` | 15.3% | 45.8% | 0.2% |
+| raw `c`, no scaling | 15.3% | 45.8% | 0.2% |
+| `K_i` equalizing every species median to 1 | 15.3% | 45.8% | 0.2% |
+| `K_i` spread over `1e-3 ... 1e3` | 15.3% | 45.8% | 0.2% |
+| **`log(c)`** (as shipped) | **27.0%** | 31.7% | **25.4%** |
 
-`_independent_gp` wraps every output in `Standardize(m=1)`, which subtracts the
-mean and divides by the standard deviation before fitting, so a linear rescaling
-is removed before the GP ever sees it. Log helps because it is *nonlinear*: it
-changes the shape of the target, not its units. A constant multiplier changes
-only the units.
+The middle row is the strongest form of the idea: species medians span five
+orders of magnitude — `2.9e-06` for the consumed reagent against `4.5e-01` for
+pyrrolidine — and equalizing them changes nothing at all.
+
+The reason is structural. `_independent_gp` fits one `SingleTaskGP` per component
+column, each wrapped in its own `Standardize(m=1)`, so **every species is already
+independently centred and scaled to unit variance before the GP sees it.** A
+per-species constant is undone by that species' own standardizer. Constant
+scaling cannot change a fit that is invariant to constant scaling by
+construction.
+
+Log is not a rescaling. It is a nonlinear reshaping: it converts multiplicative
+structure into additive structure, so a concentration that varies over decades
+becomes a target with roughly uniform curvature, and — the part that matters
+here — it makes the E-factor's division into a subtraction. That is why f2 moves
+from +0.2% to +25.4% while no amount of constant scaling moves it at all.
+
+If the goal were purely to keep posterior samples positive, other options exist
+(a softplus link, or modelling `sqrt(c)` as DTLZ2 does with its radial term).
+Log was chosen because it does that *and* linearizes the ratio.
 
 #### Three fixes were needed to make it usable
 
