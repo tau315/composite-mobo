@@ -1,0 +1,5 @@
+# Shell scripts run on Linux (the Slurm cluster) regardless of where they are
+# checked out. Without this, core.autocrlf on Windows gives them CRLF endings
+# both in the working copy and in `git archive` output, and bash then fails with
+# "set: pipefail: invalid option name" on the very first line.
+*.sh text eol=lf
