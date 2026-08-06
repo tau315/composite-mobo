@@ -1,14 +1,25 @@
-"""RCM46 Optimal Power Flow benchmark: the same real 14-bus system as
-RCM40 (benchmark_rcm40.py), but with 4 objectives instead of 2.
+"""Unconstrained IEEE 14-bus power-flow benchmark derived from RWCMOP case 46.
 
-From the CEC2021 Real-World Constrained Multi-Objective Optimization suite
-(Kumar et al. 2021), case 46 -- identical admittance matrices, load
-vectors, and 34-dim design space as case 40, but minimizing fuel cost and
-voltage deviation in addition to active/reactive power loss. Two of the
-four objectives (fuel cost, voltage deviation) are pure closed-form
-functions of the design variables themselves (generator setpoints, bus
-voltage magnitudes); the other two need the admittance-matrix solve
-(I = YV) that RCM40 also needs.
+Not the published benchmark. Case 46 of the CEC2021 Real-World *Constrained*
+Multi-Objective Optimization suite (Kumar et al. 2021) imposes 26 equality
+constraints -- active and reactive power balance at buses 2-14 -- which this
+module does not enforce, because nothing in this repo does constrained BO. That
+changes the problem, not just its difficulty: without power balance the
+generator setpoints are decoupled from network demand, so fuel cost can be
+driven down independently and the four reactive setpoints are inert. Numbers
+from here must not be reported as performance on RWCMOP46.
+
+What is faithful is the objective algebra and the design space: the same
+admittance matrices and bounds as RCM40 (benchmark_rcm40.py), minimizing fuel
+cost and voltage deviation alongside active and reactive power loss. Two of the
+four objectives (fuel cost, voltage deviation) are closed-form functions of the
+design variables themselves; the other two need the admittance solve (I = YV).
+
+On dimension: 34 variables, but only 30 carry any objective gradient and 90% of
+the gradient energy sits in 18 of them, with a participation ratio near 15. Call
+it moderate effective dimension, not high-dimensional. (The published
+constrained problem is worse in this respect -- its feasible manifold is
+8-dimensional.)
 
 Confirms a genuine discrepancy with RCM40: RCM40's second objective uses
 `imag(V(1)*conj(I(2)))`, an apparent index slip (bus 2's current against
@@ -84,7 +95,7 @@ def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
 
 
 PROBLEM = BenchmarkProblem(
-    name="RCM46 Optimal Power Flow (4 objectives, 34 dimensions)",
+    name="Unconstrained IEEE 14-bus power flow (4 objectives, 34 dimensions)",
     slug="rcm46_opf_4obj_34d",
     dim=DIM,
     num_objectives=4,
@@ -92,7 +103,13 @@ PROBLEM = BenchmarkProblem(
     evaluate_components=evaluate_components,
     compose=compose,
     ideal=torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.double),
-    ref_point=torch.tensor([10.0, 150.0, 400.0, 10.0], dtype=torch.double),
+    # Nadir of the attainable Pareto front, from 20k Sobol designs. The suite's
+    # own nadir is not usable here: it describes the constrained feasible set,
+    # which this variant does not restrict to, and no random design dominates
+    # it -- every run would score zero. The previous [10, 150, 400, 10] failed
+    # the other way, dominated by 100% of random designs, so hypervolume mostly
+    # measured filling the box rather than finding a front.
+    ref_point=torch.tensor([7.207, 109.847, 318.602, 4.151], dtype=torch.double),
 )
 
 
