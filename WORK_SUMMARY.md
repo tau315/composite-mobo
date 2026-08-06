@@ -92,13 +92,66 @@ physical identity the source data satisfies to reported precision (ratios
 
 ### SNAr — the useful example
 
-Nucleophilic aromatic substitution, **d=4, m=2, p=5**. The intermediates are the
-five outlet concentrations from the published kinetic model; the objectives are
-space-time yield and E-factor.
+Nucleophilic aromatic substitution of 2,4-difluoronitrobenzene with pyrrolidine
+in a flow reactor, **d=4, m=2, p=5**. The four design variables are residence
+time, pyrrolidine equivalents, inlet concentration, and temperature.
 
-E-factor is waste mass over product mass — **a ratio**, which is exactly the
-structure composition exists to exploit. Three fixes were needed to make it
-usable:
+#### What the composition actually is
+
+One evaluation integrates the published five-species kinetic model and returns
+every outlet concentration, not just the ones the objectives need:
+
+```
+h = ( c_reagent, c_pyrrolidine, c_product, c_regioisomer, c_bis-adduct )
+```
+
+Only `c_product` is desirable. The regioisomer is the wrong substitution
+position, the bis-adduct is over-reaction, and both reagents are leftovers. This
+is the key point: **a chemist running this reaction measures all five by HPLC in
+the same experiment.** The intermediate is free — it is what the assay already
+produces — and collapsing it to two numbers before modeling throws away four
+fifths of what was measured.
+
+The known map turns those concentrations into the two things a process chemist
+actually cares about:
+
+```
+space-time yield:  STY = 60 · MW_product · c_product · q / V        (kg product per m³ per hour)
+
+environmental factor:  E = (ρ_solvent + Σ_waste MW_i · c_i) / (MW_product · c_product)
+                                                              (kg waste per kg product)
+```
+
+`q = V/τ` is the volumetric flow, fixed by the reactor volume and the residence
+time — both design variables — so it is computed exactly rather than modeled.
+(It also cancels algebraically in E, which Ricky spotted independently.)
+
+#### Why this structure is worth exploiting
+
+**E-factor is a ratio, and that is the whole point.** Waste over product, with
+`c_product` in the denominator. As the product concentration falls the objective
+diverges — its distribution across the design space is heavily right-skewed,
+skew ≈ 4.7, with a 99th percentile 4.4× the median. A GP fitted directly to E
+has to represent that near-singular surface with a stationary kernel and a few
+dozen points, which it does badly.
+
+The concentrations underneath are smooth: they are ODE solutions in the design
+variables, monotone in residence time and temperature over most of the domain.
+So the composite route models five easy things and does the hard part —
+the division — in closed form, exactly.
+
+Against the three conditions: `g` **creates** the difficulty rather than smoothing
+it away (condition 1); `h` is low-dimensional and smooth, so a GP genuinely
+learns it (condition 2); and the flow term is known exactly and bypasses the GP
+entirely (condition 3). SNAr satisfies all three, which is why it screens at
++27.5% ± 4.3%.
+
+This is also why SNAr is the more *useful* of the two benchmarks despite being
+messier: it is a real process-chemistry trade-off — make more product versus
+generate less waste — and its exploitable structure is a ratio, which is the
+single most common shape of a derived scientific objective.
+
+#### Three fixes were needed to make it usable
 
 1. **Deduplicated the components.** Product concentration appeared twice, so two
    GPs were fitted to bit-identical data. Beyond the wasted fit, a Monte Carlo
@@ -106,18 +159,25 @@ usable:
    physical state. (Caught by Ricky's review — good catch.) 6 components → 5.
 2. **Moved total flow into `g`.** It is `V/τ`, a closed-form function of a design
    variable, and was being fitted by a GP.
-3. **Modeled concentrations on a log scale.** The E-factor divides by the product
-   concentration, so a GP whose posterior reaches near zero makes the ratio
-   explode. Across five splits the screen ranged **−57% to +46%** — unusable. In
-   log space `exp()` is positive by construction and the ratio becomes a
-   difference.
+3. **Modeled concentrations on a log scale.** The same ratio that makes this
+   benchmark attractive also makes it fragile: a GP fitted to `c_product`
+   directly puts posterior mass near and below zero in the low-product tail, and
+   dividing by that explodes. Across five splits the screen ranged **−57% to
+   +46%** — unusable as evidence. In log space `exp()` is positive by
+   construction and the ratio becomes a difference.
 
 | | before | after |
 |---|---|---|
 | screen | +20.2% ± 43.4%, range [−57%, +46%] | **+27.5% ± 4.3%, range [+23%, +34%]** |
 
+A fully consumed species then needs a floor, set at 1 µM — the detection limit
+of the HPLC/GC monitoring such a reaction, so below it the simulator's value is
+not a measurable quantity anyway. It uses the smooth `log(c + floor)` rather
+than `log(max(c, floor))`, which avoids leaving a censored plateau for the GP to
+fit.
+
 The objectives are unchanged throughout — these are changes to how the
-intermediate is represented, not to the benchmark.
+intermediate is *represented*, not to the benchmark.
 
 ## 3. The three conditions
 
