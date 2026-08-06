@@ -1,6 +1,9 @@
 # Codex / agent-local state
 .agents/
 .codex/
+.codex-work/
+.claude/
+codex-use.md
 
 # Python bytecode and caches
 __pycache__/
@@ -43,6 +46,8 @@ benchmark_results*.csv
 *.run.xml
 *.synctex.gz
 *.toc
+paper/
+
 
 # IDE and OS files
 .vscode/

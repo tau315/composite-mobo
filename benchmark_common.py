@@ -32,6 +32,7 @@ from solvers import (
     MORBOConfig,
     SolverResult,
     TIMING_KEYS,
+    composer,
     chebyshev_bo,
     composite_chebyshev_bo,
     composite_mobo,
@@ -88,8 +89,14 @@ class BenchmarkProblem:
     ref_point: Tensor
     exact_max_hypervolume: float | None = None
 
+    @property
+    def composed(self) -> Callable[[Tensor, Tensor | None], Tensor]:
+        """``compose`` normalized to ``(H, X)``, whether or not it wants X."""
+
+        return composer(self.compose)
+
     def evaluate(self, X: Tensor) -> Tensor:
-        return self.compose(self.evaluate_components(X))
+        return self.composed(self.evaluate_components(X), X)
 
     def validate(self) -> None:
         if self.dim < 1 or self.num_objectives < 2:
@@ -100,7 +107,7 @@ class BenchmarkProblem:
             .double()
         )
         components = self.evaluate_components(probe).double()
-        objectives = self.compose(components).double()
+        objectives = self.composed(components, probe).double()
         if components.ndim != 2 or components.shape[0] != len(probe):
             raise ValueError("components must have shape n x number_of_components")
         if objectives.shape != (len(probe), self.num_objectives):
@@ -520,7 +527,7 @@ def _validated_payload(
                 atol=VALIDATION_ATOL,
             ):
                 return None
-            expected_y = problem.compose(components)
+            expected_y = problem.composed(components, X)
         else:
             if payload["components"] is not None:
                 return None

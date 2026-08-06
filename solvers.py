@@ -3,8 +3,9 @@
 All public solvers assume that ``evaluate(X)`` returns objectives to *minimize*.
 Composite solvers additionally receive ``evaluate_components(X)`` and a known,
 differentiable ``compose(H)`` map satisfying
-``compose(evaluate_components(X)) == evaluate(X)``. Thus the implemented
-composite graph is strictly ``X -> h(X) -> g(h(X))``.
+``compose(evaluate_components(X)) == evaluate(X)``. A benchmark whose known map
+also needs exact design coordinates declares ``compose(H, X)`` instead, so that
+quantities known without error are never handed to a GP; see ``composer``.
 Internally objectives are negated because BoTorch's acquisition functions use a
 maximization convention.
 """
@@ -12,6 +13,7 @@ maximization convention.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 import math
 import os
 import shutil
@@ -216,12 +218,49 @@ def _optimize(
         return candidates[values.argmax()].detach(), True
 
 
-def _check_composition(C: Tensor, Y: Tensor, compose: Composer) -> None:
-    reconstructed = compose(C)
+def _accepts_inputs(compose: Composer) -> bool:
+    """True when ``compose`` wants the exact design inputs as a second argument."""
+
+    try:
+        parameters = list(inspect.signature(compose).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is p.VAR_POSITIONAL for p in parameters):
+        return True
+    positional = [
+        p
+        for p in parameters
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= 2
+
+
+def composer(compose: Composer) -> Callable[[Tensor, Optional[Tensor]], Tensor]:
+    """Normalize a known map to a uniform ``(H, X)`` callable.
+
+    Coordinates of ``X`` that ``g`` needs are known exactly, so handing them to
+    a GP throws away information for nothing. A benchmark that can use them
+    declares a second parameter and receives the candidate designs; one that
+    cannot is called with ``H`` alone. Every call site goes through here so the
+    capability cannot be silently lost again.
+
+    Implementations that take ``X`` must broadcast it against the leading Monte
+    Carlo sample dimensions of ``H``.
+    """
+
+    if _accepts_inputs(compose):
+        return compose
+    return lambda H, X=None: compose(H)
+
+
+def _check_composition(
+    C: Tensor, Y: Tensor, X: Tensor, compose_fn: Callable[..., Tensor]
+) -> None:
+    reconstructed = compose_fn(C, X)
     if reconstructed.shape != Y.shape or not torch.allclose(
         reconstructed, Y, atol=1e-7, rtol=1e-5
     ):
-        raise ValueError("compose(evaluate_components(X)) must equal evaluate(X)")
+        raise ValueError("compose(evaluate_components(X), X) must equal evaluate(X)")
 
 
 def standard_mobo(
@@ -312,12 +351,15 @@ def composite_mobo(
         timing, "initial_evaluate_seconds", evaluate_components, X
     ).double()
     Y = _timed(timing, "initial_evaluate_seconds", evaluate, X).double()
-    _timed(timing, "initial_compose_seconds", _check_composition, C, Y, compose)
+    compose_fn = composer(compose)
+    _timed(timing, "initial_compose_seconds", _check_composition, C, Y, X, compose_fn)
     initial_wall = (perf_counter() - initial_started) / len(X)
     wall_seconds = [initial_wall] * len(X)
     acquisition_fallbacks = 0
     ref_max = -torch.as_tensor(ref_point, dtype=torch.double)
-    objective = GenericMCMultiOutputObjective(lambda samples, X=None: -compose(samples))
+    objective = GenericMCMultiOutputObjective(
+        lambda samples, X=None: -compose_fn(samples, X)
+    )
     for _ in range(n_iter):
         iteration_started = perf_counter()
         model = _timed(timing, "gp_fit_seconds", _independent_gp, X, C)
@@ -350,7 +392,7 @@ def composite_mobo(
         ).double()
         # compose(c) == evaluate(x) is checked once on the initial design, so
         # the loop reuses it instead of paying a second expensive evaluation.
-        y = _timed(timing, "bo_compose_seconds", compose, c).double()
+        y = _timed(timing, "bo_compose_seconds", compose_fn, c, x).double()
         X, C, Y = torch.cat((X, x)), torch.cat((C, c)), torch.cat((Y, y))
         wall_seconds.append(perf_counter() - iteration_started)
     timing["solver_total_seconds"] = perf_counter() - solver_started
@@ -384,6 +426,7 @@ def _scalarized_runs(
     solver_started = perf_counter()
     timing = _new_timing()
     acquisition_fallbacks = 0
+    compose_fn = composer(compose) if compose is not None else None
     torch.manual_seed(seed)
     initial_started = perf_counter()
     X_initial = _timed(timing, "initial_design_seconds", _sobol, n_init, dim, seed)
@@ -402,7 +445,8 @@ def _scalarized_runs(
             _check_composition,
             C_initial,
             Y_initial,
-            compose,
+            X_initial,
+            compose_fn,
         )
     initial_wall = (perf_counter() - initial_started) / n_init
     wall_seconds = [initial_wall] * n_init
@@ -432,7 +476,7 @@ def _scalarized_runs(
                 objective = GenericMCObjective(
                     lambda samples, X=None, w=weight: (
                         -smooth_tchebycheff(
-                            compose(samples),
+                            compose_fn(samples, X),
                             w,
                             ideal,
                             temperature,  # type: ignore[misc]
@@ -468,7 +512,7 @@ def _scalarized_runs(
                 c = _timed(
                     timing, "bo_evaluate_seconds", evaluate_components, x
                 ).double()
-                y = _timed(timing, "bo_compose_seconds", compose, c).double()
+                y = _timed(timing, "bo_compose_seconds", compose_fn, c, x).double()
                 C = torch.cat((C, c))
             X, Y = torch.cat((X, x)), torch.cat((Y, y))
             wall_seconds.append(perf_counter() - iteration_started)
@@ -664,6 +708,7 @@ def _high_dim_scalarized_runs(
     solver_started = perf_counter()
     timing = _new_timing()
     acquisition_fallbacks = 0
+    compose_fn = composer(compose) if compose is not None else None
     torch.manual_seed(seed)
     initial_started = perf_counter()
     X_initial = _timed(timing, "initial_design_seconds", _sobol, n_init, dim, seed)
@@ -682,7 +727,8 @@ def _high_dim_scalarized_runs(
             _check_composition,
             C_initial,
             Y_initial,
-            compose,
+            X_initial,
+            compose_fn,
         )
     initial_wall = (perf_counter() - initial_started) / n_init
     wall_seconds = [initial_wall] * n_init
@@ -709,7 +755,7 @@ def _high_dim_scalarized_runs(
                 objective = GenericMCObjective(
                     lambda samples, X=None, w=weight: (
                         -smooth_tchebycheff(
-                            compose(samples),
+                            compose_fn(samples, X),
                             w,
                             ideal,
                             temperature,  # type: ignore[misc]
@@ -869,8 +915,11 @@ def _morbo(
         if evaluate_components
         else None
     )
+    compose_fn = composer(compose) if compose is not None else None
     if C is not None:
-        _timed(timing, "initial_compose_seconds", _check_composition, C, Y, compose)
+        _timed(
+            timing, "initial_compose_seconds", _check_composition, C, Y, X, compose_fn
+        )
     initial_wall = (perf_counter() - initial_started) / n_init
     wall_seconds = [initial_wall] * n_init
     ref = -torch.as_tensor(ref_point, dtype=torch.double)
@@ -917,7 +966,9 @@ def _morbo(
             cand = torch.where(mask, cand, centers[tr])
             with torch.no_grad():
                 sample = model.posterior(cand).rsample().squeeze(0)
-            obj_sample = sample if C is None else -compose(sample)  # type: ignore[misc]
+            obj_sample = (
+                sample if C is None else -compose_fn(sample, cand)  # type: ignore[misc]
+            )
             base = _hv_max(-Y, ref)
             scores = torch.tensor(
                 [_hv_max(torch.cat((-Y, v[None])), ref) - base for v in obj_sample]
@@ -1046,6 +1097,13 @@ def _batched_morbo(
 
         def raw_evaluate_components(X: Tensor) -> Tensor:
             return evaluate_components(X).double()
+
+        # The vendored engine never passes designs alongside the responses, so
+        # an exact-input map cannot be honoured on this path.
+        if _accepts_inputs(compose):
+            raise ValueError(
+                "batched_morbo cannot supply exact inputs to a compose(H, X) map"
+            )
 
         def raw_compose(H: Tensor) -> Tensor:
             return compose(H).double()

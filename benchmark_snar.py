@@ -87,11 +87,13 @@ def _outlet_concentrations(
 
 
 def evaluate_components(X: torch.Tensor) -> torch.Tensor:
-    """Return objective-specific physical quantities.
+    """Return the outlet concentrations, the only simulated quantities.
 
-    Product concentration and total flow are intentionally repeated in the
-    E-factor group. Composite solvers therefore fit each objective's component
-    GPs independently even when the underlying physical quantity overlaps.
+    Total flow is fixed by the reactor volume and the residence time, both of
+    which are design variables, so it is known in closed form and is computed
+    inside ``compose`` instead of being handed to a GP. Product concentration is
+    still repeated across the two objective groups so each objective's
+    components are fitted independently.
     """
 
     X = X.double()
@@ -100,29 +102,32 @@ def evaluate_components(X: torch.Tensor) -> torch.Tensor:
     outlet = _outlet_concentrations(
         residence_time, equivalents, inlet_concentration, temperature
     )
-    total_flow = REACTOR_VOLUME_ML / residence_time
-    sty_group = torch.stack((outlet[:, PRODUCT_INDEX], total_flow), dim=-1)
-    e_factor_group = torch.cat((outlet, total_flow.unsqueeze(-1)), dim=-1)
-    return torch.cat((sty_group, e_factor_group), dim=-1)
+    return torch.cat((outlet[:, PRODUCT_INDEX].unsqueeze(-1), outlet), dim=-1)
 
 
-def compose(H: torch.Tensor) -> torch.Tensor:
+def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     """Calculate normalized minimization objectives from the intermediates."""
 
+    X = X.double()
+    residence_time = (
+        INPUT_LOWER.to(X)[0] + X[..., 0] * (INPUT_UPPER.to(X)[0] - INPUT_LOWER.to(X)[0])
+    )
+    # Exact, so it broadcasts onto the component posterior's sample dimensions.
+    total_flow = REACTOR_VOLUME_ML / residence_time.clamp_min(1.0e-8)
+    total_flow = total_flow + torch.zeros_like(H[..., 0])
+
     product_sty = H[..., 0].clamp_min(0.0)
-    flow_sty = H[..., 1].clamp_min(1.0e-8)
     sty = (
         6.0e4
         / 1000.0
         * MOLECULAR_WEIGHTS[PRODUCT_INDEX].to(H)
         * product_sty
-        * flow_sty
+        * total_flow
         / REACTOR_VOLUME_ML
     )
     sty_objective = 1.0 - (sty / STY_SCALE).clamp(0.0, 1.0)
 
-    outlet = H[..., 2:7].clamp_min(0.0)
-    flow_e = H[..., 7].clamp_min(1.0e-8)
+    outlet = H[..., 1:6].clamp_min(0.0)
     product_e = outlet[..., PRODUCT_INDEX].clamp_min(1.0e-12)
     weights = MOLECULAR_WEIGHTS.to(H)
     waste_mass = (
@@ -131,15 +136,12 @@ def compose(H: torch.Tensor) -> torch.Tensor:
         + weights[3] * outlet[..., 3]
         + weights[4] * outlet[..., 4]
     )
-    numerator = flow_e * ETHANOL_DENSITY + 1.0e-3 * flow_e * waste_mass
+    numerator = total_flow * ETHANOL_DENSITY + 1.0e-3 * total_flow * waste_mass
     denominator = (
-        1.0e-3 * weights[PRODUCT_INDEX] * product_e * flow_e
+        1.0e-3 * weights[PRODUCT_INDEX] * product_e * total_flow
     ).clamp_min(1.0e-12)
     e_factor = (numerator / denominator).clamp_max(1000.0)
-    return torch.stack(
-        (sty_objective, e_factor / E_FACTOR_SCALE),
-        dim=-1,
-    )
+    return torch.stack((sty_objective, e_factor / E_FACTOR_SCALE), dim=-1)
 
 
 PROBLEM = BenchmarkProblem(

@@ -691,3 +691,93 @@ def test_method_keys_are_stable_slugs():
     assert benchmark_common.method_key("Objective-GP STCH") == "objective_gp_stch"
     assert benchmark_common.method_key("Direct qLogEHVI") == "direct_qlogehvi"
     assert benchmark_common.method_key("Composite MORBO") == "composite_morbo"
+
+
+# --------------------------------------------------------------------------
+# Exact-input routing through the known map
+# --------------------------------------------------------------------------
+
+
+def test_composer_detects_whether_the_known_map_wants_exact_inputs():
+    assert solvers._accepts_inputs(lambda H, X: H)
+    assert solvers._accepts_inputs(lambda *args: args[0])
+    assert not solvers._accepts_inputs(lambda H: H)
+    # A one-argument map is still callable through the normalized signature.
+    assert solvers.composer(lambda H: H * 2)(torch.ones(3), None).tolist() == [2, 2, 2]
+
+
+def _exact_input_problem() -> BenchmarkProblem:
+    """The angular term is a design coordinate, so it must never be modelled."""
+
+    def components(X):
+        return (X[..., 1:] - 0.5).square().sum(dim=-1, keepdim=True).sqrt()
+
+    def compose(H, X):
+        distance = H[..., 0].square()
+        angle = torch.pi * X[..., 0].double() / 2.0
+        angle = angle + torch.zeros_like(distance)
+        radius = 1.0 + distance
+        return torch.stack((radius * angle.cos(), radius * angle.sin()), dim=-1)
+
+    return BenchmarkProblem(
+        name="exact-input problem",
+        slug="exact",
+        dim=3,
+        num_objectives=2,
+        suite="low",
+        evaluate_components=components,
+        compose=compose,
+        ideal=torch.zeros(2, dtype=torch.double),
+        ref_point=torch.full((2,), 2.5, dtype=torch.double),
+    )
+
+
+def test_exact_inputs_reach_the_known_map_in_every_composite_solver():
+    problem = _exact_input_problem()
+    problem.validate()
+    weights = torch.tensor([[0.5, 0.5]], dtype=torch.double)
+    common = dict(n_init=3, raw_samples=8, num_restarts=2)
+    results = (
+        solvers.composite_mobo(
+            problem.evaluate, problem.evaluate_components, problem.compose,
+            problem.dim, problem.ref_point, n_iter=1, **common,
+        ),
+        solvers.composite_chebyshev_bo(
+            problem.evaluate, problem.evaluate_components, problem.compose,
+            problem.dim, weights, problem.ideal, n_per_scalarization=1, **common,
+        ),
+        solvers.composite_spherical_chebyshev_bo(
+            problem.evaluate, problem.evaluate_components, problem.compose,
+            problem.dim, weights, problem.ideal, n_per_scalarization=1, **common,
+        ),
+        solvers.composite_morbo(
+            problem.evaluate, problem.evaluate_components, problem.compose,
+            problem.dim, problem.ref_point, n_iter=1,
+            config=solvers.MORBOConfig(n_trust_regions=2, raw_samples=8),
+            n_init=3,
+        ),
+    )
+    for result in results:
+        # Reaching here at all means compose(H, X) was called with real designs
+        # throughout; the recorded objectives must match the exact recomputation.
+        assert torch.allclose(result.Y, problem.evaluate(result.X), atol=1e-8)
+
+
+def test_exact_input_problems_round_trip_through_artifacts(tmp_path, monkeypatch):
+    _run_cli(_exact_input_problem(), tmp_path, [], monkeypatch)
+    written = sorted(p.parent.name for p in tmp_path.rglob("*.json"))
+    assert written == [
+        "composite_qlogehvi", "composite_stch", "direct_qlogehvi", "objective_gp_stch",
+    ]
+    # Validation recomputes the objectives through compose(H, X); resuming
+    # proves the exact inputs are reproduced identically from the artifact.
+    _run_cli(_exact_input_problem(), tmp_path, [], monkeypatch)
+
+
+def test_batched_morbo_refuses_a_map_it_cannot_supply_inputs_to():
+    problem = _exact_input_problem()
+    with pytest.raises(ValueError, match="cannot supply exact inputs"):
+        solvers.composite_batched_morbo(
+            problem.evaluate, problem.evaluate_components, problem.compose,
+            problem.dim, problem.ref_point, n_init=3, n_iter=1,
+        )

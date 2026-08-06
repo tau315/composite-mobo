@@ -8,21 +8,28 @@ from benchmark_common import BenchmarkProblem, run_benchmark
 
 
 def evaluate_components(X: torch.Tensor) -> torch.Tensor:
+    """Model only the radial distance, which is the one unknown quantity.
+
+    The angular coordinate is a design variable, so it is known exactly and is
+    routed through ``compose`` rather than given a GP. Modelling ``sqrt`` of the
+    distance keeps posterior samples in the valid non-negative domain.
+    """
+
     X = X.double()
-    distance = (X[..., 1:] - 0.5).square().sum(dim=-1)
-    angle = torch.pi * X[..., 0] / 2.0
-    return torch.stack((distance, angle.cos(), distance, angle.sin()), dim=-1)
+    distance = (X[..., 1:] - 0.5).square().sum(dim=-1, keepdim=True)
+    return distance.sqrt()
 
 
-def compose(H: torch.Tensor) -> torch.Tensor:
-    distance_1 = H[..., 0].clamp_min(0)
-    angle_1 = H[..., 1].clamp(0.0, 1.0)
-    distance_2 = H[..., 2].clamp_min(0)
-    angle_2 = H[..., 3].clamp(0.0, 1.0)
-    return torch.stack(
-        ((1.0 + distance_1) * angle_1, (1.0 + distance_2) * angle_2),
-        dim=-1,
-    )
+def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """Apply the known DTLZ2 outer maps using the exact angular coordinate."""
+
+    distance = H[..., 0].square()
+    angle = torch.pi * X[..., 0].double() / 2.0
+    # Give the exact angle the leading Monte Carlo sample dimensions of the
+    # component posterior so the two broadcast together.
+    angle = angle + torch.zeros_like(distance)
+    radius = 1.0 + distance
+    return torch.stack((radius * angle.cos(), radius * angle.sin()), dim=-1)
 
 
 PROBLEM = BenchmarkProblem(

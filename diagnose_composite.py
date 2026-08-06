@@ -55,8 +55,8 @@ def diagnose(
 
     C_train = problem.evaluate_components(X_train).double()
     C_test = problem.evaluate_components(X_test).double()
-    Y_train = problem.compose(C_train).double()
-    Y_test = problem.compose(C_test).double()
+    Y_train = problem.composed(C_train, X_train).double()
+    Y_test = problem.composed(C_test, X_test).double()
 
     # Fitting needs gradients; only the predictions are taken under no_grad.
     direct_model = _independent_gp(X_train, Y_train)
@@ -64,7 +64,7 @@ def diagnose(
     with torch.no_grad():
         direct_prediction = direct_model.posterior(X_test).mean
         component_prediction = component_model.posterior(X_test).mean
-        composite_prediction = problem.compose(component_prediction).double()
+        composite_prediction = problem.composed(component_prediction, X_test).double()
 
     direct_rmse = _standardized_rmse(direct_prediction, Y_test).mean()
     composite_rmse = _standardized_rmse(composite_prediction, Y_test).mean()
