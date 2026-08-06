@@ -9,7 +9,12 @@ umask 077
 ENV="${ENV:-$HOME/composite-mobo/env}"
 SBATCH="${SBATCH:-sbatch}"
 REPO_ARCHIVE_SHA256="${REPO_ARCHIVE_SHA256:-}"
-readonly COMMIT RUN REPO_ARCHIVE ENV SBATCH REPO_ARCHIVE_SHA256
+# botorch imports jax, and jaxlib is built with AVX: on a node whose CPU lacks
+# it, importing botorch raises before any of our code runs, so the task dies
+# without even leaving a failure artifact. Roughly 70 nodes here are unlabelled
+# for avx. Set CONSTRAINT= to disable if a future environment does not need it.
+CONSTRAINT="${CONSTRAINT-avx}"
+readonly COMMIT RUN REPO_ARCHIVE ENV SBATCH REPO_ARCHIVE_SHA256 CONSTRAINT
 # Benchmarks to run, as module stems. Each contributes TRIALS x 4 array tasks.
 readonly -a BENCHMARKS=(
   benchmark_reizman
@@ -285,18 +290,18 @@ fi
 printf 'stage\tjob_id\n' > "$RUN/job_ids.tsv"
 setup_job=$("$SBATCH" --parsable \
   --output="$RUN/logs/setup-%j.out" --error="$RUN/logs/setup-%j.err" \
-  "$RUN/setup.sbatch" "$RUN/run.env")
+  "${constraint_args[@]}" "$RUN/setup.sbatch" "$RUN/run.env")
 setup_job=${setup_job%%;*}
 printf 'setup\t%s\n' "$setup_job" >> "$RUN/job_ids.tsv"
 array_job=$("$SBATCH" --parsable --dependency="afterok:$setup_job" \
   --array="$array_spec" \
   --output="$RUN/logs/array-%A_%a.out" --error="$RUN/logs/array-%A_%a.err" \
-  "$RUN/array.sbatch" "$RUN/run.env")
+  "${constraint_args[@]}" "$RUN/array.sbatch" "$RUN/run.env")
 array_job=${array_job%%;*}
 printf 'array\t%s\n' "$array_job" >> "$RUN/job_ids.tsv"
 aggregate_job=$("$SBATCH" --parsable --dependency="afterany:$array_job" \
   --output="$RUN/logs/aggregate-%j.out" --error="$RUN/logs/aggregate-%j.err" \
-  "$RUN/aggregate.sbatch" "$RUN/run.env")
+  "${constraint_args[@]}" "$RUN/aggregate.sbatch" "$RUN/run.env")
 aggregate_job=${aggregate_job%%;*}
 printf 'aggregate\t%s\n' "$aggregate_job" >> "$RUN/job_ids.tsv"
 
