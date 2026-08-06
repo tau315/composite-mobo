@@ -16,11 +16,16 @@ REPO_ARCHIVE_SHA256="${REPO_ARCHIVE_SHA256:-}"
 CONSTRAINT="${CONSTRAINT-avx}"
 readonly COMMIT RUN REPO_ARCHIVE ENV SBATCH REPO_ARCHIVE_SHA256 CONSTRAINT
 # Benchmarks to run, as module stems. Each contributes TRIALS x 4 array tasks.
-readonly -a BENCHMARKS=(
-  benchmark_reizman
-  benchmark_snar
-  benchmark_rcm46
-)
+if [[ -n "${BENCHMARKS_OVERRIDE:-}" ]]; then
+  read -r -a BENCHMARKS <<< "$BENCHMARKS_OVERRIDE"
+else
+  BENCHMARKS=(
+    benchmark_reizman
+    benchmark_snar
+    benchmark_rcm46
+  )
+fi
+readonly -a BENCHMARKS
 # Method keys are fixed by `_solver_jobs` in benchmark_common.py: one set per
 # suite. `--list-methods` on any benchmark prints the set it will use.
 readonly -a LOW_METHODS=(
@@ -42,7 +47,14 @@ readonly -a HIGH_BENCHMARKS=(
   benchmark_rcm40
   benchmark_rcm46
 )
-readonly TRIALS=20
+# Trials and evaluation budget are overridable so a campaign can be pointed
+# at the regime being measured. Raising TRIALS buys statistical power;
+# lowering EVALUATIONS keeps the measurement inside the range where the
+# surrogate still matters, instead of past the point where every method has
+# converged and the arms are indistinguishable by construction.
+TRIALS="${TRIALS:-20}"
+EVALUATIONS="${EVALUATIONS:-}"
+readonly TRIALS EVALUATIONS
 readonly TASK_COUNT=$((${#BENCHMARKS[@]} * TRIALS * 4))
 
 [[ -f "$REPO_ARCHIVE" ]] || { echo "Archive not found: $REPO_ARCHIVE" >&2; exit 2; }
@@ -76,6 +88,8 @@ mv "$tasks_tmp" "$RUN/tasks.tsv"
   printf 'REPO_ARCHIVE=%q\n' "$REPO_ARCHIVE"
   printf 'REPO_ARCHIVE_SHA256=%q\n' "$REPO_ARCHIVE_SHA256"
   printf 'ENV=%q\n' "$ENV"
+  printf 'TRIALS=%q\n' "$TRIALS"
+  printf 'EVALUATIONS=%q\n' "$EVALUATIONS"
 } > "$RUN/run.env"
 
 cat > "$RUN/setup.sbatch" <<'SETUP'
@@ -143,12 +157,15 @@ task=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$RUN/tasks.tsv")
 IFS=$'\t' read -r task_id benchmark trial method <<< "$task"
 [[ "$task_id" == "$SLURM_ARRAY_TASK_ID" ]]
 
+budget_args=()
+[[ -n "${EVALUATIONS:-}" ]] && budget_args=(--evaluations "$EVALUATIONS")
 cd "$RUN/repo"
 python "${benchmark}.py" \
-  --trials 20 \
+  --trials "$TRIALS" \
   --trial "$trial" \
   --method "$method" \
   --seed 0 \
+  "${budget_args[@]}" \
   --results-dir "$RUN/output/results"
 
 slug=$(python -c "import $benchmark; print($benchmark.PROBLEM.slug)")
@@ -178,11 +195,15 @@ source "$1"
 source /share/apps/software/anaconda3/etc/profile.d/conda.sh
 conda activate "$ENV"
 export COMPOSITE_MOBO_COMMIT="$COMMIT"
+export TRIALS EVALUATIONS
+budget_args=()
+[[ -n "${EVALUATIONS:-}" ]] && budget_args=(--evaluations "$EVALUATIONS")
 cd "$RUN/repo"
 
 python - "$RUN/tasks.tsv" "$RUN/output/results" "$RUN/output/timing_fallback_summary.json" <<'PY'
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -196,9 +217,11 @@ def parsed_args(module):
     """Reproduce exactly the settings the array tasks ran with."""
 
     parser = benchmark_common._argument_parser(module.PROBLEM)
-    args = parser.parse_args(
-        ["--trials", "20", "--seed", "0", "--results-dir", str(results_dir)]
-    )
+    argv = ["--trials", os.environ["TRIALS"], "--seed", "0",
+            "--results-dir", str(results_dir)]
+    if os.environ.get("EVALUATIONS"):
+        argv += ["--evaluations", os.environ["EVALUATIONS"]]
+    args = parser.parse_args(argv)
     if args.iterations is None:
         args.iterations = args.evaluations - args.initial
     if args.per_weight is None:
@@ -271,8 +294,9 @@ while IFS=$'\t' read -r _ benchmark _ _; do
   echo "$benchmark"
 done < "$RUN/tasks.tsv" | sort -u | while read -r benchmark; do
   python "${benchmark}.py" \
-    --trials 20 \
+    --trials "$TRIALS" \
     --seed 0 \
+    "${budget_args[@]}" \
     --results-dir "$RUN/output/results" \
     --summary-only \
     --output "$RUN/output/hypervolume_$benchmark.png"

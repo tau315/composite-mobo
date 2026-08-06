@@ -149,7 +149,9 @@ esac
     assert "#SBATCH --time=04:00:00" in array
     for name in ("OMP", "MKL", "OPENBLAS", "NUMEXPR"):
         assert f"export {name}_NUM_THREADS=1" in array
-    for option in ("--trials 20", "--seed 0"):
+    # Trials now come from the environment rather than being hardcoded, so
+    # assert the plumbing rather than a literal count.
+    for option in ('--trials "$TRIALS"', "--seed 0"):
         assert option in array
         assert option in aggregate
     assert "--trial " in array and "--method " in array
@@ -209,3 +211,55 @@ def test_cluster_requirements_are_exactly_pinned():
         "matplotlib==3.10.8",
         "pytest==8.4.1",
     ]
+
+
+def test_trials_budget_and_benchmark_list_are_overridable(tmp_path):
+    """A campaign must be pointable at the regime it means to measure."""
+
+    archive = tmp_path / "repo.tgz"
+    archive.write_bytes(b"test archive")
+    sbatch_log = tmp_path / "sbatch.log"
+    fake_sbatch = tmp_path / "sbatch"
+    fake_sbatch.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SBATCH_LOG"
+echo 1
+""",
+        encoding="utf-8",
+    )
+    fake_sbatch.chmod(0o755)
+    run = tmp_path / "run"
+    completed = subprocess.run(
+        [_bash(), LAUNCHER.as_posix()],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "MAX_CONCURRENT": "",
+            "TRIALS": "50",
+            "EVALUATIONS": "20",
+            "BENCHMARKS_OVERRIDE": "benchmark_reizman benchmark_snar",
+            "COMMIT": "abc1234",
+            "RUN": run.as_posix(),
+            "REPO_ARCHIVE": archive.as_posix(),
+            "SBATCH": fake_sbatch.as_posix(),
+            "SBATCH_LOG": sbatch_log.as_posix(),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    tasks = [line.split("\t") for line in (run / "tasks.tsv").read_text().splitlines()]
+    assert len(tasks) == 2 * 50 * 4
+    assert {task[1] for task in tasks} == {"benchmark_reizman", "benchmark_snar"}
+    assert any("--array=0-399" in line.split() for line in sbatch_log.read_text().splitlines())
+
+    # Both the worker and the aggregate step must see the same settings, or the
+    # aggregate revalidates artifacts against a configuration that never ran.
+    run_env = (run / "run.env").read_text(encoding="utf-8")
+    assert "TRIALS=50" in run_env and "EVALUATIONS=20" in run_env
+    for stage in ("array", "aggregate"):
+        script = (run / f"{stage}.sbatch").read_text(encoding="utf-8")
+        assert '--evaluations "$EVALUATIONS"' in script
+        assert '"${budget_args[@]}"' in script
