@@ -6,6 +6,27 @@ import subprocess
 ROOT = Path(__file__).parents[1]
 LAUNCHER = ROOT / "run_unicorn.sh"
 
+# Every environment variable run_unicorn.sh reads. Slurm propagates a submitting
+# shell's environment into the job, and the cluster runs this suite from inside
+# a campaign, so any of these would otherwise leak in and change what the
+# launcher does underneath the assertions.
+LAUNCHER_INPUTS = (
+    "MAX_CONCURRENT",
+    "TRIALS",
+    "EVALUATIONS",
+    "BENCHMARKS_OVERRIDE",
+    "CONSTRAINT",
+    "ENV",
+)
+
+
+def _clean_env(overrides):
+    """The ambient environment with every launcher input neutralised."""
+
+    env = {k: v for k, v in os.environ.items() if k not in LAUNCHER_INPUTS}
+    env.update(overrides)
+    return env
+
 
 def _bash():
     if os.name == "nt":
@@ -34,18 +55,13 @@ esac
     )
     fake_sbatch.chmod(0o755)
     run = tmp_path / "run"
-    env = {
-        **os.environ,
-        # The launcher reads MAX_CONCURRENT from the environment, and Slurm
-        # propagates a submitting shell's variables into the job that runs this
-        # suite. Clear it so the test controls the array spec it asserts on.
-        "MAX_CONCURRENT": "",
+    env = _clean_env({
         "COMMIT": "abc1234",
         "RUN": run.as_posix(),
         "REPO_ARCHIVE": archive.as_posix(),
         "SBATCH": fake_sbatch.as_posix(),
         "SBATCH_LOG": sbatch_log.as_posix(),
-    }
+    })
 
     completed = subprocess.run(
         [_bash(), LAUNCHER.as_posix()],
@@ -183,16 +199,14 @@ echo 1
     completed = subprocess.run(
         [_bash(), LAUNCHER.as_posix()],
         cwd=ROOT,
-        env={
-            **os.environ,
+        env=_clean_env({
             "CONSTRAINT": "",
-            "MAX_CONCURRENT": "",
             "COMMIT": "abc1234",
             "RUN": (tmp_path / "run").as_posix(),
             "REPO_ARCHIVE": archive.as_posix(),
             "SBATCH": fake_sbatch.as_posix(),
             "SBATCH_LOG": sbatch_log.as_posix(),
-        },
+        }),
         capture_output=True,
         text=True,
         check=False,
@@ -232,9 +246,7 @@ echo 1
     completed = subprocess.run(
         [_bash(), LAUNCHER.as_posix()],
         cwd=ROOT,
-        env={
-            **os.environ,
-            "MAX_CONCURRENT": "",
+        env=_clean_env({
             "TRIALS": "50",
             "EVALUATIONS": "20",
             "BENCHMARKS_OVERRIDE": "benchmark_reizman benchmark_snar",
@@ -243,7 +255,7 @@ echo 1
             "REPO_ARCHIVE": archive.as_posix(),
             "SBATCH": fake_sbatch.as_posix(),
             "SBATCH_LOG": sbatch_log.as_posix(),
-        },
+        }),
         capture_output=True,
         text=True,
         check=False,
