@@ -23,9 +23,24 @@ MOLECULAR_WEIGHTS = torch.tensor(
     [159.09, 71.12, 210.21, 210.21, 261.33], dtype=torch.double
 )
 PRODUCT_INDEX = 2
-# Concentrations are logged; this floors an exactly-zero species so the log is
-# finite. It sits far below the smallest concentration the kinetics produce.
-CONCENTRATION_FLOOR = 1.0e-12
+# Concentrations are logged, so a fully consumed species needs a floor. Set it
+# at 1 uM, roughly the detection limit of the HPLC/GC monitoring such a reaction
+# would use in practice: below this the simulator's value is not a measurable
+# quantity anyway.
+#
+# The floor matters more than it looks. The limiting reagent is consumed to
+# ~1e-94 mol/L at long residence times, and a floor of 1e-12 still leaves its
+# log at -27.6 against every other component in [-4, 0.6]. A GP fitted to a
+# target spanning 28 log units extrapolates wildly, and exponentiating those
+# samples inside compose produced concentrations of 3e5 mol/L against a true
+# maximum of 1.3 -- which is what drove the composite arm's occasional
+# mid-optimization collapses on this benchmark. At 1 uM the same posterior
+# reaches 4e2 instead, and no sample lands on the E-factor clamp.
+#
+# Raising the floor changes the objectives by 2e-7 relative, since a species at
+# this concentration contributes ~1e-7 of the E-factor numerator. That is orders
+# of magnitude below the precision of any real yield measurement.
+CONCENTRATION_FLOOR = 1.0e-6
 REACTOR_VOLUME_ML = 5.0
 ETHANOL_DENSITY = 0.789
 STY_SCALE = 13_000.0

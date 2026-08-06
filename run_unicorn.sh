@@ -272,7 +272,7 @@ for benchmark_name, module in modules.items():
 if incompatible:
     print("incomplete paired trials: " + ",".join(incompatible))
     raise SystemExit(1)
-print("paired trials: 20 per family/benchmark")
+print(f"paired trials: {args.trials} per family/benchmark")
 summary = {
     "artifacts": len(payloads),
     "timing_totals_seconds": {
