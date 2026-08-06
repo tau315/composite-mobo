@@ -128,28 +128,49 @@ time — both design variables — so it is computed exactly rather than modeled
 
 #### Why this structure is worth exploiting
 
-**E-factor is a ratio, and that is the whole point.** Waste over product, with
-`c_product` in the denominator. As the product concentration falls the objective
-diverges — its distribution across the design space is heavily right-skewed,
-skew ≈ 4.7, with a 99th percentile 4.4× the median. A GP fitted directly to E
-has to represent that near-singular surface with a stationary kernel and a few
-dozen points, which it does badly.
+Worth being precise here, because the obvious answer is wrong. Measuring each
+objective separately:
 
-The concentrations underneath are smooth: they are ODE solutions in the design
-variables, monotone in residence time and temperature over most of the domain.
-So the composite route models five easy things and does the hard part —
-the division — in closed form, exactly.
+| what is modelled | STY | E-factor |
+|---|---:|---:|
+| raw concentrations | **+45.8%** | +0.2% |
+| raw concentrations, flow factor held constant | **+0.0%** | — |
+| log concentrations (the benchmark as shipped) | +11% to +45% | **+17% to +33%** |
 
-Against the three conditions: `g` **creates** the difficulty rather than smoothing
-it away (condition 1); `h` is low-dimensional and smooth, so a GP genuinely
-learns it (condition 2); and the flow term is known exactly and bypasses the GP
-entirely (condition 3). SNAr satisfies all three, which is why it screens at
-+27.5% ± 4.3%.
+**STY is linear in the intermediates, and still gains 45.8%.** `STY = const ·
+c_product · q(x)`. That is linear in `h`, so the GP-closure argument says it
+should gain nothing — and with the flow factor held constant it gains exactly
+0.0%, as predicted. But `q = V/τ` varies **fourfold** across the domain, and
+that variation is worth the entire +45.8%.
+
+The reason is that multiplying a GP by a known function `a(x)` yields a process
+with kernel `a(x)a(x')k(x,x')`, which is **non-stationary**. A direct GP with a
+stationary kernel cannot express that. So a map that is linear in `h` but whose
+coefficients depend on `x` is *not* closed under the GP, and the composite model
+is a genuinely richer class. **The closure argument only rules out linear maps
+with constant coefficients** — which is exactly what the OPF and penicillin
+benchmarks have, and why they score −10.5% and 0.0%.
+
+**E-factor's ratio does less than expected.** On raw concentrations it is worth
++0.2%, essentially nothing, despite being a textbook structure-creating map. It
+only becomes exploitable once concentrations are modelled on a log scale. So the
+log transform is not merely numerical hygiene: `exp` is itself a
+structure-creating map, and it is what makes the denominator worth modelling
+separately.
+
+Against the three conditions: `h` is smooth and low-dimensional, being ODE
+solutions monotone in residence time and temperature over most of the domain, so
+a GP genuinely learns it (condition 2); the flow term is known exactly and
+bypasses the GP (condition 3), and here that is the dominant effect rather than
+a refinement. Condition 1 holds through `exp` and the ratio together, not
+through the ratio alone.
 
 This is also why SNAr is the more *useful* of the two benchmarks despite being
-messier: it is a real process-chemistry trade-off — make more product versus
-generate less waste — and its exploitable structure is a ratio, which is the
-single most common shape of a derived scientific objective.
+messier. It is a real process-chemistry trade-off — make more product versus
+generate less waste — and its exploitable structure is the ordinary shape of a
+derived scientific objective: an intensive quantity scaled by a known operating
+condition, and a ratio against a measured baseline. Neither is exotic, which is
+the point.
 
 #### Three fixes were needed to make it usable
 
@@ -186,7 +207,10 @@ Full write-up with per-benchmark classification in
 
 1. **`g` must create structure, not destroy it.** Ratios, exponentials, sharp
    peaks, thresholds. Averages, sums, and integrals over a rough response fail;
-   linear maps fail provably.
+   linear maps with **constant** coefficients fail provably. A map that is linear
+   in `h` but scaled by a known function of `x` does *not* fail — it induces a
+   non-stationary kernel a direct GP cannot express, and on SNAr that single
+   effect is worth +45.8%.
 2. **`h` must be learnable at the problem's dimension.** A compact intermediate
    is not automatically a learnable one. This killed the Ceviche photonics
    candidate: a perfect map (amplitude-squaring plus thresholds) over 6 numbers
