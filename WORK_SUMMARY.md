@@ -441,6 +441,31 @@ It also localizes the mid-run dip: both objectives regress at ten evaluations,
 so it is not an artifact of one badly-behaved objective but a genuine period
 where the composite surrogate misleads the acquisition.
 
+#### Ablation: does the log transform actually matter?
+
+Both figures above use the log transform. Running the identical 50-trial
+campaign with it removed — SNAr then evaluates bit-identically to the published
+benchmark — separates what the transform changes from what it does not.
+
+| | yield @7 | yield @10 | yield @20 | E-factor @10 |
+|---|---:|---:|---:|---:|
+| without log (benchmark as published) | 9358.13 | 10327.04 | 11454.84 | 10.07 |
+| with log | 9339.81 | 10263.05 | 11460.96 | 10.13 |
+
+**The transform barely moves the optimization at all**, even though it moves the
+surrogate screen from +20.2% ± 43.4% to +27.5% ± 4.3% and takes the E-factor's
+own advantage from +0.2% to +25.4%. A large change in how well the composite
+model *predicts*, and almost none in what the optimizer *finds*.
+
+Two consequences. First, this is the third independent sign that surrogate
+advantage is necessary but not sufficient — a better-fitting composite surrogate
+does not automatically buy better optimization. Second, it rules the transform
+out as the explanation for the ten-evaluation dip, which appears in both runs at
+almost the same magnitude.
+
+Figures for the untransformed run are in `docs/figures/no-transform/` for
+comparison.
+
 ### Reading the two together
 
 Both benchmarks agree on the early-budget claim: **+15.1%** and **+14.4%** at
