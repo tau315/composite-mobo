@@ -140,47 +140,89 @@ Full write-up with per-benchmark classification in
 
 ## 4. Results
 
-50 trials, 20-evaluation budget, paired direct-vs-composite.
+50 trials, 20-evaluation budget, paired direct-vs-composite, commit `7ddf6aa`.
+Hypervolume is reported as mean ± standard error; `p` is a paired Wilcoxon test.
+Both arms of a pair share an initial design and Monte Carlo streams, so the
+comparison is matched trial by trial.
 
-**Reizman–Suzuki, qLogEHVI**
+Note the two acquisition families spend their budget differently. qLogEHVI runs
+5 initial + 15 sequential evaluations. STCH branches four scalarization weights
+from one shared initial design, so 20 evaluations becomes 5 + 4×3 = 17; its
+trace is ordered by weight block rather than chronologically, which is why only
+endpoints are reported for it.
+
+### Reizman–Suzuki (d=3, m=2, p=1)
+
+**qLogEHVI**
 
 | budget | direct | composite | delta | wins | p |
 |---|---:|---:|---:|---:|---:|
-| 7 evals | 0.31845 | 0.36656 | **+15.11%** | 39/50 | 1.7e-06 |
-| 10 evals | 0.36766 | 0.38504 | **+4.73%** | 37/50 | 3.0e-06 |
-| 15 evals | 0.39865 | 0.40212 | +0.87% | 36/50 | 1.4e-04 |
-| 20 (final) | 0.40700 | 0.41141 | **+1.08%** | 39/50 | 6.4e-07 |
+| 7 evals | 0.31845 ± 0.00967 | 0.36656 ± 0.00232 | **+15.11%** | 39/50 | 1.7e-06 |
+| 10 evals | 0.36766 ± 0.00507 | 0.38504 ± 0.00130 | **+4.73%** | 37/50 | 3.0e-06 |
+| 15 evals | 0.39865 ± 0.00079 | 0.40212 ± 0.00083 | +0.87% | 36/50 | 1.4e-04 |
+| 20 (final) | 0.40700 ± 0.00065 | 0.41141 ± 0.00052 | **+1.08%** | 39/50 | 6.4e-07 |
 
-Composite wins at every budget, p ≤ 1.4e-04 throughout. The advantage is largest
-when data is scarcest, which is the regime that matters when evaluations are
-expensive.
+**STCH**
 
-**SNAr, qLogEHVI**
+| budget | direct | composite | delta | wins | p |
+|---|---:|---:|---:|---:|---:|
+| 17 (final) | 0.37706 ± 0.00491 | 0.38104 ± 0.00159 | +1.06% | 25/50 | 0.44 |
 
-| budget | delta | wins | p |
-|---|---:|---:|---:|
-| 7 evals | **+14.35%** | 36/50 | 5.6e-04 |
-| 10 evals | **−5.64%** | 15/50 | 4.8e-03 |
-| 15 evals | −1.21% | 21/50 | 0.33 |
-| 20 (final) | +0.52% | 23/50 | 0.59 |
+This is the clean result. Composite wins at every qLogEHVI budget with
+p ≤ 1.4e-04, and the margin is largest when data is scarcest — +15.1% at seven
+evaluations, decaying to +1.1% by twenty as both methods converge on the same
+front. That decay is the expected shape: surrogate quality matters most before
+either method has enough data to find the front by brute force.
 
-Non-monotone, and the dip is real rather than noise. At 10 evaluations the
-*median* paired difference is ≈0 while the *mean* is negative: most runs tie and
-a tail of runs collapses. We traced one mechanism — GP extrapolation in log
-space being exponentiated — and fixed it with a physically motivated 1 µM floor
-(the detection limit of the HPLC/GC such a reaction would use). Whether that
-fully explains the dip is still open.
+Composite is also markedly more *reliable* early: its standard deviation across
+trials is 4.2× smaller at seven evaluations and 3.9× smaller at ten. Direct
+qLogEHVI sometimes starts badly; composite essentially never does.
 
-**STCH** — Reizman +1.06% (25/50, p=0.44), SNAr −4.64% (17/50, p=0.0063).
+STCH is positive but not significant, which is unsurprising at 17 evaluations
+spread across four weights — three adaptive steps per weight is very little.
 
-> **Correction worth flagging.** An earlier run reported Reizman STCH at
-> **−1.66%, 6/50, p=2.1e-09**, which looked like a decisive negative result for
-> composite plus Chebyshev scalarization. That was a budget bug: `--evaluations`
-> did not constrain STCH, so its arms ran 45 evaluations against qLogEHVI's 20.
-> At a matched 17-evaluation budget Reizman STCH is **+1.06% and not
-> significant**. The "STCH loses" conclusion does not survive; what survives is
-> that composite's advantage decays with budget, consistent with the qLogEHVI
-> curves.
+### SNAr (d=4, m=2, p=5)
+
+**qLogEHVI**
+
+| budget | direct | composite | delta | wins | p |
+|---|---:|---:|---:|---:|---:|
+| 7 evals | 0.72469 ± 0.02775 | 0.82865 ± 0.02232 | **+14.35%** | 36/50 | 5.6e-04 |
+| 10 evals | 0.96090 ± 0.01085 | 0.90670 ± 0.01812 | **−5.64%** | 15/50 | 4.8e-03 |
+| 15 evals | 0.99444 ± 0.00352 | 0.98239 ± 0.00845 | −1.21% | 21/50 | 0.33 |
+| 20 (final) | 1.00287 ± 0.00297 | 1.00809 ± 0.00203 | +0.52% | 23/50 | 0.59 |
+
+**STCH**
+
+| budget | direct | composite | delta | wins | p |
+|---|---:|---:|---:|---:|---:|
+| 17 (final) | 0.91469 ± 0.01844 | 0.87230 ± 0.02087 | **−4.64%** | 17/50 | 6.3e-03 |
+
+SNAr is not a clean win and should not be presented as one. Composite starts
+well ahead (+14.4%, p=5.6e-04), then falls significantly behind at ten
+evaluations (−5.6%, 15/50, p=4.8e-03), then recovers to a statistical tie.
+
+The dip is a real effect, not sampling noise, and its shape is informative: at
+ten evaluations the *median* paired difference is ≈0 while the *mean* is −0.050.
+Most runs tie; a tail of runs collapses (worst three at −0.36, −0.34, −0.32). So
+composite is not uniformly worse mid-run — it occasionally fails badly.
+
+One mechanism was found and fixed: the log-space component GP could extrapolate
+to `exp()` values of 3×10⁵ mol/L against a true maximum of 1.3, which a 1 µM
+floor (the detection limit of the HPLC/GC monitoring such a reaction) reduces to
+4×10². Whether that fully accounts for the dip is **still open** — the numbers
+above already include the fix, and the dip is still present.
+
+SNAr STCH is a genuine loss at this budget, and the only significant negative in
+the set.
+
+### Reading the two together
+
+Both benchmarks agree on the early-budget claim: **+15.1%** and **+14.4%** at
+seven evaluations, both significant. They disagree afterwards — Reizman holds its
+lead to the end, SNAr does not. The honest summary is that composite modeling
+buys sample efficiency in the data-scarce regime, and that on a harder,
+higher-`p` problem that advantage is not stable across the whole run.
 
 ## 5. Honest caveats
 
