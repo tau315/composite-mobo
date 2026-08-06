@@ -172,6 +172,66 @@ derived scientific objective: an intensive quantity scaled by a known operating
 condition, and a ratio against a measured baseline. Neither is exotic, which is
 the point.
 
+#### Input to output, with every transform
+
+```mermaid
+flowchart TD
+    X["x in [0,1]^4<br/>normalized design"] --> UN["unnormalize"]
+    UN --> PHYS["tau 0.5-2.0 min<br/>equivalents 1-5<br/>c_in 0.1-0.5 M<br/>T 30-120 C"]
+    PHYS --> RK4["RK4 integration<br/>5-species SNAr kinetics<br/>256 steps"]
+    RK4 --> CONC["5 outlet concentrations c<br/>reagent, pyrrolidine, product,<br/>regioisomer, bis-adduct"]
+    CONC --> LOG["log(c + 1 uM)<br/><b>transform</b>"]
+    LOG --> H["h : 5 log concentrations<br/><b>this is what the GPs model</b>"]
+
+    H --> EXP["exp(h) - 1 uM<br/><b>inverse transform</b>"]
+    PHYS -. "tau only, exact" .-> Q["q = V / tau<br/><b>never modelled</b>"]
+
+    EXP --> STY["STY = 60 MW_p c_p q / V"]
+    Q --> STY
+    EXP --> EF["E = (rho + sum MW_i c_i) / (MW_p c_p)"]
+
+    STY --> F1["f1 = 1 - clamp(STY / 13000)"]
+    EF --> F2["f2 = clamp(E, max 1000) / 500"]
+
+    style H fill:#e8e0f5,stroke:#7B68B5,stroke-width:2px
+    style Q fill:#fbe6da,stroke:#C05A2E,stroke-width:2px
+    style LOG fill:#fff4cc,stroke:#c9a227
+    style EXP fill:#fff4cc,stroke:#c9a227
+```
+
+Everything below the shaded `h` box is the known map `g`, evaluated exactly on
+Monte Carlo samples of the component posteriors. The direct method skips the
+whole middle and fits two GPs straight from `x` to `f1`, `f2`.
+
+Two transforms are worth calling out because they are choices, not physics:
+
+- **`log(c + 1 uM)`**, inverted by `exp` inside `g`. The shifted form is smooth
+  and strictly monotone, so a fully consumed species approaches `log(1 uM)`
+  gently rather than hitting a censored plateau. The floor is the detection
+  limit of the HPLC/GC that would monitor this reaction.
+- **`q = V / tau` is computed from `x` and never modelled.** It is exact, and
+  routing it through `g` is worth +45.8% on the yield objective by itself.
+
+#### Would a large constant multiplier work instead of the log?
+
+No, and not by a small margin -- it cannot work at all. Modelling `K * c` and
+dividing `K` back out inside `g` gives results identical to four significant
+figures for every `K` tried:
+
+| representation | advantage | f1 | f2 |
+|---|---:|---:|---:|
+| `log(c)` (as shipped) | **27.0%** | 31.7% | **25.4%** |
+| `c x 1` | 15.3% | 45.8% | 0.2% |
+| `c x 100` | 15.3% | 45.8% | 0.2% |
+| `c x 10,000` | 15.3% | 45.8% | 0.2% |
+| `c x 1,000,000` | 15.3% | 45.8% | 0.2% |
+
+`_independent_gp` wraps every output in `Standardize(m=1)`, which subtracts the
+mean and divides by the standard deviation before fitting, so a linear rescaling
+is removed before the GP ever sees it. Log helps because it is *nonlinear*: it
+changes the shape of the target, not its units. A constant multiplier changes
+only the units.
+
 #### Three fixes were needed to make it usable
 
 1. **Deduplicated the components.** Product concentration appeared twice, so two
@@ -313,6 +373,33 @@ above already include the fix, and the dip is still present.
 
 SNAr STCH is a genuine loss at this budget, and the only significant negative in
 the set.
+
+
+#### Per-objective view
+
+Hypervolume says how good the front is; these say which objective the composite
+model is actually helping with. Both are the best value found so far, in the
+units a process chemist reads.
+
+![SNAr best space-time yield](docs/figures/snar_yield.png)
+
+![SNAr best E-factor](docs/figures/snar_efactor.png)
+
+| objective | at 7 evals | at 10 evals | at 20 evals |
+|---|---|---|---|
+| space-time yield | composite **+1250 kg m⁻³ h⁻¹**, 36/50, p=5.4e-04 | composite −641, 14/50, p=6.0e-03 | +61, 17/50, p=0.52 |
+| E-factor | +0.02, 23/50, p=0.40 | composite +0.70 worse, 17/50, p=8.2e-03 | −0.04, 24/50, p=0.86 |
+
+The split is informative. **Composite's early advantage is almost entirely in
+the yield objective** — it finds high-throughput conditions roughly three
+evaluations sooner — while E-factor is a tie at every budget. That matches the
+mechanism: yield carries the exactly-known flow factor worth +45.8%, whereas
+E-factor's ratio only becomes exploitable through the log representation and
+gains less from it.
+
+It also localizes the mid-run dip: both objectives regress at ten evaluations,
+so it is not an artifact of one badly-behaved objective but a genuine period
+where the composite surrogate misleads the acquisition.
 
 ### Reading the two together
 
