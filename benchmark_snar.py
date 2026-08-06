@@ -175,7 +175,15 @@ PROBLEM = BenchmarkProblem(
     evaluate_components=evaluate_components,
     compose=compose,
     ideal=torch.zeros(2, dtype=torch.double),
-    ref_point=torch.full((2,), 2.5, dtype=torch.double),
+    # Just past the worst attainable corner. Over a 4096-point Sobol sweep the
+    # objectives span [0.18, 1.00] and [0.017, 1.05], so the previous (2.5, 2.5)
+    # credited every method with a large constant slab no design can reach: 78%
+    # of the reported hypervolume was already present after five random points.
+    # Tightening it drops that to 43%, which is what the measurement is actually
+    # about. It does not change any paired comparison -- both arms share an
+    # initial design, so a common offset cancels in every paired difference --
+    # but it stops the headline number from being mostly free volume.
+    ref_point=torch.tensor([1.05, 1.10], dtype=torch.double),
 )
 
 
