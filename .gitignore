@@ -60,3 +60,7 @@ desktop.ini
 
 # Scratch space for probes and delegated-search output
 tmp/
+
+# Campaign results are large; keep the analysis reproducible from the cluster
+# archive rather than committing every artifact.
+results/paper-lowdim/output/results/
