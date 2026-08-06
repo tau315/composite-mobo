@@ -12,7 +12,7 @@ REPO_ARCHIVE_SHA256="${REPO_ARCHIVE_SHA256:-}"
 readonly COMMIT RUN REPO_ARCHIVE ENV SBATCH REPO_ARCHIVE_SHA256
 # Benchmarks to run, as module stems. Each contributes TRIALS x 4 array tasks.
 readonly -a BENCHMARKS=(
-  benchmark_dtlz2
+  benchmark_reizman
   benchmark_snar
   benchmark_nanoparticle_rgb
   benchmark_penicillin

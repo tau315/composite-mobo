@@ -36,6 +36,10 @@ esac
     run = tmp_path / "run"
     env = {
         **os.environ,
+        # The launcher reads MAX_CONCURRENT from the environment, and Slurm
+        # propagates a submitting shell's variables into the job that runs this
+        # suite. Clear it so the test controls the array spec it asserts on.
+        "MAX_CONCURRENT": "",
         "COMMIT": "abc1234",
         "RUN": run.as_posix(),
         "REPO_ARCHIVE": archive.as_posix(),
@@ -59,7 +63,7 @@ esac
         for index, (benchmark, trial, method) in enumerate(
             product(
                 (
-                    "benchmark_dtlz2",
+                    "benchmark_reizman",
                     "benchmark_snar",
                     "benchmark_nanoparticle_rgb",
                     "benchmark_penicillin",
@@ -84,6 +88,20 @@ esac
     ]
     submissions = sbatch_log.read_text().splitlines()
     assert any("--array=0-319" in line.split() for line in submissions)
+    # ... and that a concurrency cap, when asked for, rides on the same flag.
+    capped = subprocess.run(
+        [_bash(), LAUNCHER.as_posix()],
+        cwd=ROOT,
+        env={**env, "MAX_CONCURRENT": "100", "RUN": (tmp_path / "run2").as_posix()},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert capped.returncode == 0, capped.stdout + capped.stderr
+    assert any(
+        "--array=0-319%100" in line.split()
+        for line in sbatch_log.read_text().splitlines()
+    )
     assert any("--dependency=afterok:101" in line for line in submissions)
     assert any("--dependency=afterany:102" in line for line in submissions)
 
