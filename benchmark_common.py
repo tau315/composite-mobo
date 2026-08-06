@@ -22,6 +22,14 @@ import time
 import traceback
 from typing import Callable, Literal
 
+import matplotlib
+
+# Benchmarks write PNGs from Slurm workers and from the test suite, neither of
+# which has a display. Selecting the non-interactive backend before pyplot is
+# imported keeps figure writing independent of ambient GUI state; without it
+# matplotlib may pick Tk and fail on an installation with a broken Tcl. `--show`
+# opts back in to an interactive window.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -913,7 +921,13 @@ def _plot_traces(
     fig.savefig(output, dpi=220, bbox_inches="tight")
     print(f"Saved plot: {output.resolve()}")
     if show:
-        plt.show()
+        # The file is already written, so an unusable GUI backend must not take
+        # the run down with it.
+        try:
+            matplotlib.use("TkAgg", force=True)
+            plt.show()
+        except Exception as error:  # pragma: no cover - depends on the display
+            print(f"Could not open a plot window ({error}); the file is written.")
     else:
         plt.close(fig)
 
