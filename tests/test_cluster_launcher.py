@@ -101,6 +101,11 @@ esac
         for line in sbatch_log.read_text().splitlines()
     )
     assert any("--dependency=afterok:101" in line for line in submissions)
+    # Every stage must be pinned to AVX-capable nodes: jaxlib is built with AVX
+    # and botorch imports jax, so a task landing elsewhere dies at import before
+    # it can even record a failure. An unset array silently expands to nothing
+    # under `set -u`, so assert the flag actually reaches sbatch.
+    assert sum("--constraint=avx" in line.split() for line in submissions) == 3
     assert any("--dependency=afterany:102" in line for line in submissions)
 
     launcher = LAUNCHER.read_text(encoding="utf-8")
@@ -147,6 +152,42 @@ esac
     assert "--summary-only" in aggregate
     assert "composite-mobo-$COMMIT.tgz" in aggregate
     assert not any(word in launcher.lower() for word in ("api_key", "password", "secret"))
+
+
+def test_node_constraint_can_be_disabled(tmp_path):
+    """CONSTRAINT= opts out, for an environment that does not need the pin."""
+
+    archive = tmp_path / "repo.tgz"
+    archive.write_bytes(b"test archive")
+    sbatch_log = tmp_path / "sbatch.log"
+    fake_sbatch = tmp_path / "sbatch"
+    fake_sbatch.write_text(
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$SBATCH_LOG"
+echo 1
+""",
+        encoding="utf-8",
+    )
+    fake_sbatch.chmod(0o755)
+    completed = subprocess.run(
+        [_bash(), LAUNCHER.as_posix()],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "CONSTRAINT": "",
+            "MAX_CONCURRENT": "",
+            "COMMIT": "abc1234",
+            "RUN": (tmp_path / "run").as_posix(),
+            "REPO_ARCHIVE": archive.as_posix(),
+            "SBATCH": fake_sbatch.as_posix(),
+            "SBATCH_LOG": sbatch_log.as_posix(),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "--constraint" not in sbatch_log.read_text()
 
 
 def test_cluster_requirements_are_exactly_pinned():

@@ -287,6 +287,11 @@ if [[ -n "${MAX_CONCURRENT:-}" ]]; then
   array_spec+="%$MAX_CONCURRENT"
 fi
 
+constraint_args=()
+if [[ -n "$CONSTRAINT" ]]; then
+  constraint_args=(--constraint="$CONSTRAINT")
+fi
+
 printf 'stage\tjob_id\n' > "$RUN/job_ids.tsv"
 setup_job=$("$SBATCH" --parsable \
   --output="$RUN/logs/setup-%j.out" --error="$RUN/logs/setup-%j.err" \

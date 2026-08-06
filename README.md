@@ -11,10 +11,15 @@ $$
 f_i(x)=g_i\left(h_{i1}(x),\ldots,h_{ik_i}(x)\right).
 $$
 
-Each intermediate column has its own independent GP. Different objectives may
-use different numbers of intermediates. They may also use the same underlying
-physical quantity, but that quantity is repeated in the component matrix so it
-is still modeled independently for each objective.
+Each intermediate column has its own independent GP, and different objectives
+may use different numbers of intermediates. Where two objectives depend on the
+same underlying physical quantity, that quantity appears **once**: a second GP
+on identical data buys no information, costs a fit, and would let a Monte Carlo
+draw give the two objectives different values for one physical state.
+
+A component belongs in the matrix only if it is genuinely measured. Anything the
+design fixes in closed form is passed to the known map instead, through
+`compose(H, X)`, so it is never given surrogate uncertainty it does not have.
 
 All solvers minimize objectives on the normalized input cube
 $[0,1]^d$. The benchmark files perform any required conversion to physical

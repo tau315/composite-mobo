@@ -87,22 +87,22 @@ def _outlet_concentrations(
 
 
 def evaluate_components(X: torch.Tensor) -> torch.Tensor:
-    """Return the outlet concentrations, the only simulated quantities.
+    """Return the five outlet concentrations, the only simulated quantities.
 
-    Total flow is fixed by the reactor volume and the residence time, both of
-    which are design variables, so it is known in closed form and is computed
-    inside ``compose`` instead of being handed to a GP. Product concentration is
-    still repeated across the two objective groups so each objective's
-    components are fitted independently.
+    Nothing else belongs here. Total flow is fixed by the reactor volume and the
+    residence time, both design variables, so it is known in closed form and is
+    computed inside ``compose``. Product concentration is used by both
+    objectives but is modelled once: giving it a second GP would cost a fit for
+    no information and, worse, let a Monte Carlo draw hand the two objectives
+    two different product concentrations for the same physical state.
     """
 
     X = X.double()
     physical = INPUT_LOWER.to(X) + X * (INPUT_UPPER.to(X) - INPUT_LOWER.to(X))
     residence_time, equivalents, inlet_concentration, temperature = physical.T
-    outlet = _outlet_concentrations(
+    return _outlet_concentrations(
         residence_time, equivalents, inlet_concentration, temperature
     )
-    return torch.cat((outlet[:, PRODUCT_INDEX].unsqueeze(-1), outlet), dim=-1)
 
 
 def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
@@ -116,19 +116,19 @@ def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     total_flow = REACTOR_VOLUME_ML / residence_time.clamp_min(1.0e-8)
     total_flow = total_flow + torch.zeros_like(H[..., 0])
 
-    product_sty = H[..., 0].clamp_min(0.0)
+    outlet = H[..., :5].clamp_min(0.0)
+    product = outlet[..., PRODUCT_INDEX]
     sty = (
         6.0e4
         / 1000.0
         * MOLECULAR_WEIGHTS[PRODUCT_INDEX].to(H)
-        * product_sty
+        * product
         * total_flow
         / REACTOR_VOLUME_ML
     )
     sty_objective = 1.0 - (sty / STY_SCALE).clamp(0.0, 1.0)
 
-    outlet = H[..., 1:6].clamp_min(0.0)
-    product_e = outlet[..., PRODUCT_INDEX].clamp_min(1.0e-12)
+    product_e = product.clamp_min(1.0e-12)
     weights = MOLECULAR_WEIGHTS.to(H)
     waste_mass = (
         weights[0] * outlet[..., 0]
