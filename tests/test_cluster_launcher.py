@@ -15,7 +15,7 @@ def _bash():
     return "bash"
 
 
-def test_launcher_writes_the_160_task_run_contract(tmp_path):
+def test_launcher_writes_the_240_task_run_contract(tmp_path):
     archive = tmp_path / "repo.tgz"
     archive.write_bytes(b"test archive")
     sbatch_log = tmp_path / "sbatch.log"
@@ -58,26 +58,35 @@ esac
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     tasks = [line.split("\t") for line in (run / "tasks.tsv").read_text().splitlines()]
+    low = (
+        "direct_qlogehvi",
+        "composite_qlogehvi",
+        "objective_gp_stch",
+        "composite_stch",
+    )
+    # RCM46 is a high-suite problem, so it draws the high-dimensional methods.
+    high = (
+        "spherical_objective_stch",
+        "spherical_composite_stch",
+        "morbo",
+        "composite_morbo",
+    )
     expected = [
         [str(index), benchmark, str(trial), method]
         for index, (benchmark, trial, method) in enumerate(
-            product(
-                (
-                    "benchmark_reizman",
-                    "benchmark_snar",
-                ),
-                range(20),
-                (
-                    "direct_qlogehvi",
-                    "composite_qlogehvi",
-                    "objective_gp_stch",
-                    "composite_stch",
-                ),
-            )
+            [
+                (benchmark, trial, method)
+                for benchmark, methods in (
+                    ("benchmark_reizman", low),
+                    ("benchmark_snar", low),
+                    ("benchmark_rcm46", high),
+                )
+                for trial, method in product(range(20), methods)
+            ]
         )
     ]
     assert tasks == expected
-    assert len({tuple(task[1:]) for task in tasks}) == 160
+    assert len({tuple(task[1:]) for task in tasks}) == 240
     assert (run / "job_ids.tsv").read_text().splitlines() == [
         "stage\tjob_id",
         "setup\t101",
@@ -85,7 +94,7 @@ esac
         "aggregate\t103",
     ]
     submissions = sbatch_log.read_text().splitlines()
-    assert any("--array=0-159" in line.split() for line in submissions)
+    assert any("--array=0-239" in line.split() for line in submissions)
     # ... and that a concurrency cap, when asked for, rides on the same flag.
     capped = subprocess.run(
         [_bash(), LAUNCHER.as_posix()],
@@ -97,7 +106,7 @@ esac
     )
     assert capped.returncode == 0, capped.stdout + capped.stderr
     assert any(
-        "--array=0-159%100" in line.split()
+        "--array=0-239%100" in line.split()
         for line in sbatch_log.read_text().splitlines()
     )
     assert any("--dependency=afterok:101" in line for line in submissions)

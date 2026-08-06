@@ -19,6 +19,7 @@ readonly COMMIT RUN REPO_ARCHIVE ENV SBATCH REPO_ARCHIVE_SHA256 CONSTRAINT
 readonly -a BENCHMARKS=(
   benchmark_reizman
   benchmark_snar
+  benchmark_rcm46
 )
 # Method keys are fixed by `_solver_jobs` in benchmark_common.py: one set per
 # suite. `--list-methods` on any benchmark prints the set it will use.

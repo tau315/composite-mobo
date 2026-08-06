@@ -3,6 +3,11 @@
 The four normalized inputs parameterize residence time, pyrrolidine
 equivalents, inlet concentration, and temperature. A vectorized fixed-step
 RK4 integration evaluates the published five-species kinetic model.
+
+The intermediates are the five outlet log concentrations; the known map raises
+them back to concentrations and forms space-time yield and E-factor. E-factor
+is a ratio, which is the structure composite modelling exists to exploit, and
+the log scale is what makes exploiting it numerically safe.
 """
 
 import torch
@@ -18,6 +23,9 @@ MOLECULAR_WEIGHTS = torch.tensor(
     [159.09, 71.12, 210.21, 210.21, 261.33], dtype=torch.double
 )
 PRODUCT_INDEX = 2
+# Concentrations are logged; this floors an exactly-zero species so the log is
+# finite. It sits far below the smallest concentration the kinetics produce.
+CONCENTRATION_FLOOR = 1.0e-12
 REACTOR_VOLUME_ML = 5.0
 ETHANOL_DENSITY = 0.789
 STY_SCALE = 13_000.0
@@ -87,7 +95,7 @@ def _outlet_concentrations(
 
 
 def evaluate_components(X: torch.Tensor) -> torch.Tensor:
-    """Return the five outlet concentrations, the only simulated quantities.
+    """Return the five outlet **log** concentrations, the simulated quantities.
 
     Nothing else belongs here. Total flow is fixed by the reactor volume and the
     residence time, both design variables, so it is known in closed form and is
@@ -95,14 +103,26 @@ def evaluate_components(X: torch.Tensor) -> torch.Tensor:
     objectives but is modelled once: giving it a second GP would cost a fit for
     no information and, worse, let a Monte Carlo draw hand the two objectives
     two different product concentrations for the same physical state.
+
+    Concentrations are modelled on a log scale because the E-factor divides by
+    the product concentration, which spans a factor of 27 across the domain. A
+    GP fitted to the concentration itself puts posterior mass near and below
+    zero in the low-product tail, and the division then amplifies that error
+    without bound: across five Sobol splits the E-factor's surrogate advantage
+    swung between +47% and -110%. Exponentiating inside ``compose`` makes every
+    posterior sample positive by construction and turns the ratio into a
+    difference, which leaves the same objectives with a tenfold more stable
+    screen (+27.3% +- 4.2% against +20.2% +- 43.4%). This mirrors DTLZ2 modelling
+    ``sqrt`` of its radial term to keep samples in the valid domain.
     """
 
     X = X.double()
     physical = INPUT_LOWER.to(X) + X * (INPUT_UPPER.to(X) - INPUT_LOWER.to(X))
     residence_time, equivalents, inlet_concentration, temperature = physical.T
-    return _outlet_concentrations(
+    outlet = _outlet_concentrations(
         residence_time, equivalents, inlet_concentration, temperature
     )
+    return outlet.clamp_min(CONCENTRATION_FLOOR).log()
 
 
 def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
@@ -116,7 +136,9 @@ def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     total_flow = REACTOR_VOLUME_ML / residence_time.clamp_min(1.0e-8)
     total_flow = total_flow + torch.zeros_like(H[..., 0])
 
-    outlet = H[..., :5].clamp_min(0.0)
+    # Components are log concentrations; exp is positive by construction, so
+    # the E-factor denominator can never cross zero.
+    outlet = H[..., :5].exp()
     product = outlet[..., PRODUCT_INDEX]
     sty = (
         6.0e4

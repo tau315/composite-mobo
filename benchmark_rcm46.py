@@ -16,6 +16,12 @@ bus 1's voltage). This benchmark's independently-written analogous term
 uses the dimensionally-consistent `imag(V(1)*conj(I(1)))` -- the same
 formula shape, written correctly, suggesting RCM40's version really is a
 typo in the original suite.
+
+Only the admittance solve is a component. Fuel cost and voltage deviation are
+exact algebraic functions of the design variables, so they are computed inside
+``compose`` from the designs themselves; giving them to a GP would spend a fit
+learning a formula we already have, and charge the composite arm that fit's
+error on two of its four objectives.
 """
 
 from __future__ import annotations
@@ -35,46 +41,45 @@ _LOWER = torch.tensor([-1.0] * 26 + [0.0] * 8, dtype=torch.double)
 _UPPER = torch.tensor([1.0] * 34, dtype=torch.double)
 
 
-def evaluate_components(X: torch.Tensor) -> torch.Tensor:
-    """Per-bus active/reactive power injection, plus a pass-through of
-    the generator setpoints and bus-voltage magnitudes (not derived from
-    any simulation, just relabeled, since `compose` needs them alongside
-    the genuinely bus-coupled Psp/Qsp terms and only receives `H`, not
-    `X`, in this repo's evaluate_components/compose interface)."""
+def _native(X: torch.Tensor) -> torch.Tensor:
+    """Map the unit design cube onto the suite's own variable bounds."""
 
-    X_native = (_LOWER + X.double() * (_UPPER - _LOWER)).reshape(-1, DIM)
-    V_r = X_native[:, 0:13]
-    V_m = X_native[:, 13:26]
+    return _LOWER.to(X) + X.double() * (_UPPER - _LOWER).to(X)
+
+
+def evaluate_components(X: torch.Tensor) -> torch.Tensor:
+    """Per-bus active and reactive power injection, from the one admittance
+    solve (I = YV, S = V conj(I)). Nothing else is simulated."""
+
+    X_native = _native(X).reshape(-1, DIM)
     Y = torch.tensor(_G, dtype=torch.double) + 1j * torch.tensor(_B, dtype=torch.double)
     V = torch.zeros(X_native.shape[0], NUM_BUSES, dtype=torch.complex128)
     V[:, 0] = 1.0
-    V[:, 1:14] = torch.complex(V_r, V_m)
+    V[:, 1:14] = torch.complex(X_native[:, 0:13], X_native[:, 13:26])
 
-    I = V @ Y.T
-    S = V * I.conj()
-    Psp = S.real
-    Qsp = S.imag
-    Pg = X_native[:, 26:30]
-    V_mag = torch.sqrt(V_r ** 2 + V_m ** 2)  # buses 2-14
-
-    return torch.cat([Psp, Qsp, Pg, V_mag], dim=-1)
+    S = V * (V @ Y.T).conj()
+    return torch.cat([S.real, S.imag], dim=-1)
 
 
-def compose(H: torch.Tensor) -> torch.Tensor:
+def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     """f1 = fuel cost, f2 = active power loss, f3 = reactive power loss,
-    f4 = voltage deviation (CEC2021_func.m case 46's own formula)."""
+    f4 = voltage deviation (CEC2021_func.m case 46's own formulas).
 
-    Psp = H[..., 0:14]
-    Qsp = H[..., 14:28]
-    Pg = H[..., 28:32]
-    V_mag = H[..., 32:45]
+    f1 and f4 read the designs directly, so they carry no surrogate error.
+    """
+
+    X_native = _native(X)
+    Pg = X_native[..., 26:30]
+    V_mag = torch.sqrt(X_native[..., 0:13] ** 2 + X_native[..., 13:26] ** 2)
 
     fuel_b = torch.tensor(_FUEL_B, dtype=H.dtype, device=H.device)
     fuel_c = torch.tensor(_FUEL_C, dtype=H.dtype, device=H.device)
-    f1 = (fuel_b * Pg + fuel_c * Pg ** 2).sum(dim=-1)
-    f2 = Psp.sum(dim=-1)
-    f3 = Qsp.sum(dim=-1)
-    f4 = ((1.0 - V_mag) ** 2).sum(dim=-1)
+    # Exact, so broadcast onto the component posterior's sample dimensions.
+    padding = torch.zeros_like(H[..., 0])
+    f1 = (fuel_b * Pg + fuel_c * Pg ** 2).sum(dim=-1) + padding
+    f4 = ((1.0 - V_mag) ** 2).sum(dim=-1) + padding
+    f2 = H[..., 0:14].sum(dim=-1)
+    f3 = H[..., 14:28].sum(dim=-1)
     return torch.stack([f1, f2, f3, f4], dim=-1)
 
 
