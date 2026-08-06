@@ -176,30 +176,47 @@ the point.
 
 ```mermaid
 flowchart TD
-    X["x in [0,1]^4<br/>what the optimizer picks"] --> UN["rescale to physical units"]
-    UN --> PHYS["<b>tau</b> residence time 0.5-2.0 min<br/><b>equivalents</b> pyrrolidine 1-5<br/><b>c_in</b> inlet concentration 0.1-0.5 M<br/><b>T</b> temperature 30-120 C"]
-    PHYS --> RK4["RK4 integration<br/>5-species SNAr kinetics<br/>256 steps"]
-    RK4 --> CONC["5 outlet concentrations c<br/>reagent, pyrrolidine, product,<br/>regioisomer, bis-adduct"]
-    CONC --> LOG["log(c + 1 uM)<br/><b>transform</b>"]
-    LOG --> H["h : 5 log concentrations<br/><b>this is what the GPs model</b>"]
+    X["x in [0,1]^4<br/>what the optimizer picks"]
+    X -->|"T1: rescale to physical units<br/>(exact, not a modelling choice)"| PHYS
 
-    H --> EXP["exp(h) - 1 uM<br/><b>inverse transform</b>"]
-    PHYS -. "residence time, known exactly" .-> Q["q = V / tau<br/>flow rate<br/><b>never modelled</b>"]
+    PHYS["<b>tau</b> residence time 0.5-2.0 min<br/><b>equivalents</b> pyrrolidine 1-5<br/><b>c_in</b> inlet concentration 0.1-0.5 M<br/><b>T</b> temperature 30-120 C"]
 
-    EXP --> STY["STY = 60 MW_p c_p q / V"]
+    PHYS -->|"simulate"| RK4["RK4 integration<br/>5-species SNAr kinetics, 256 steps"]
+    RK4 --> CONC["5 outlet concentrations c<br/>reagent, pyrrolidine, product,<br/>regioisomer, bis-adduct<br/><i>range 1e-94 to 1.6 mol/L</i>"]
+
+    CONC -->|"<b>T2: h = log(c + 1 uM)</b><br/>ADDED BY US, not in the benchmark<br/>floor = HPLC detection limit"| H
+
+    H["<b>h : 5 log concentrations</b><br/>THE GPs MODEL EXACTLY THIS<br/><i>range -13.8 to 0.4</i>"]
+
+    H -->|"<b>T3: c = exp(h) - 1 uM</b><br/>inverse of T2, inside g"| EXP["5 concentrations, recovered"]
+    PHYS -->|"<b>T4: q = V / tau</b><br/>exact, NEVER modelled"| Q["q, flow rate<br/>2.5-10 mL/min"]
+
+    EXP --> STY["STY = 60 x MW_p x c_p x q / V"]
     Q --> STY
     EXP --> EF["E = (rho + sum MW_i c_i) / (MW_p c_p)"]
 
     STY --> F1["<b>space-time yield</b><br/>kg product m-3 h-1<br/><i>maximize</i>"]
     EF --> F2["<b>E-factor</b><br/>kg waste per kg product<br/><i>minimize</i>"]
 
-    style H fill:#e8e0f5,stroke:#7B68B5,stroke-width:2px
+    style H fill:#e8e0f5,stroke:#7B68B5,stroke-width:3px
     style Q fill:#fbe6da,stroke:#C05A2E,stroke-width:2px
-    style LOG fill:#fff4cc,stroke:#c9a227
-    style EXP fill:#fff4cc,stroke:#c9a227
-    style F1 fill:#e3f0e3,stroke:#3a7d44
-    style F2 fill:#e3f0e3,stroke:#3a7d44
+    style CONC fill:#f4f4f4,stroke:#888
+    style EXP fill:#f4f4f4,stroke:#888
+    style F1 fill:#e3f0e3,stroke:#3a7d44,stroke-width:2px
+    style F2 fill:#e3f0e3,stroke:#3a7d44,stroke-width:2px
 ```
+
+**The four transforms, and which are ours:**
+
+| | transform | ours? | why |
+|---|---|---|---|
+| T1 | `x -> physical units` | no | every benchmark does this |
+| **T2** | **`h = log(c + 1 uM)`** | **yes** | keeps posterior samples positive so the E-factor's division cannot blow up |
+| **T3** | **`c = exp(h) - 1 uM`** | **yes** | inverse of T2, applied inside `g` so the objectives are unchanged |
+| **T4** | **`q = V / tau` computed, not modelled** | **yes** | it is exactly known; worth +45.8% on yield by itself |
+
+T2 and T3 are a matched pair: together they leave `evaluate(x)` unchanged and only
+alter what the GP is asked to learn. T4 is the mechanism this paper is about.
 
 Everything below the shaded `h` box is the known map `g`, evaluated exactly on
 Monte Carlo samples of the component posteriors. The direct method skips the
