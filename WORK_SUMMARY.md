@@ -153,6 +153,13 @@ endpoints are reported for it.
 
 ### Reizman–Suzuki (d=3, m=2, p=1)
 
+![Reizman-Suzuki hypervolume](docs/figures/hypervolume_benchmark_reizman.png)
+
+Solid lines are direct methods, dotted are their composite counterparts; purple
+is qLogEHVI, green is STCH. Shading is one standard error over 50 trials. The
+vertical dashed line is the end of the shared initial design, so everything left
+of it is identical by construction.
+
 **qLogEHVI**
 
 | budget | direct | composite | delta | wins | p |
@@ -182,6 +189,13 @@ STCH is positive but not significant, which is unsurprising at 17 evaluations
 spread across four weights — three adaptive steps per weight is very little.
 
 ### SNAr (d=4, m=2, p=5)
+
+![SNAr hypervolume](docs/figures/hypervolume_benchmark_snar.png)
+
+The crossover is visible directly: composite (dotted purple) jumps ahead the
+moment the BO loop starts, direct (solid purple) overtakes around evaluation
+eight, and the two converge by twenty. Note also that the STCH curves end at 17
+evaluations rather than 20, for the budget reason given above.
 
 **qLogEHVI**
 
