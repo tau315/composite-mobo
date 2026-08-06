@@ -56,7 +56,7 @@ def _figure(root: Path, out: Path, trials: int, index: int, title: str,
                         color=COLORS[method], alpha=0.18, linewidth=0)
     ax.axvline(5, color="#666666", linestyle="--", linewidth=1.0, alpha=0.75,
                label="End of shared initial design")
-    ax.set_title(title, fontsize=13, pad=10)
+    ax.set_title(title, fontsize=12, pad=10)
     ax.set_xlabel("Total function evaluations")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.25)
@@ -75,17 +75,20 @@ def main() -> None:
     figures = Path(sys.argv[2] if len(sys.argv) > 2 else "docs/figures")
     trials = int(sys.argv[3]) if len(sys.argv) > 3 else 50
 
-    # f1 = 1 - STY/STY_SCALE and f2 = E/E_FACTOR_SCALE, both minimized.
+    # The solver works in a normalized minimize-everything form; convert back so
+    # both axes read in the units the reaction is actually reported in.
     _figure(
         root, figures / "snar_yield.png", trials, 0,
-        "SNAr: best space-time yield found",
+        "SNAr: best space-time yield found\n"
+        "(the objective carrying the exactly-known flow rate)",
         lambda f: (1.0 - f) * snar.STY_SCALE,
         "Space-time yield (kg m$^{-3}$ h$^{-1}$)",
         "higher is better",
     )
     _figure(
         root, figures / "snar_efactor.png", trials, 1,
-        "SNAr: best E-factor found",
+        "SNAr: best E-factor found\n"
+        "(the objective whose ratio the log transform linearizes)",
         lambda f: f * snar.E_FACTOR_SCALE,
         "E-factor (kg waste per kg product)",
         "lower is better",

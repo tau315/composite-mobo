@@ -131,13 +131,13 @@ time — both design variables — so it is computed exactly rather than modeled
 Worth being precise here, because the obvious answer is wrong. Measuring each
 objective separately:
 
-| what is modelled | STY | E-factor |
+| what is modelled | yield | E-factor |
 |---|---:|---:|
 | raw concentrations | **+45.8%** | +0.2% |
 | raw concentrations, flow factor held constant | **+0.0%** | — |
 | log concentrations (the benchmark as shipped) | +11% to +45% | **+17% to +33%** |
 
-**STY is linear in the intermediates, and still gains 45.8%.** `STY = const ·
+**Space-time yield is linear in the intermediates, and still gains 45.8%.** `STY = const ·
 c_product · q(x)`. That is linear in `h`, so the GP-closure argument says it
 should gain nothing — and with the flow factor held constant it gains exactly
 0.0%, as predicted. But `q = V/τ` varies **fourfold** across the domain, and
@@ -176,32 +176,40 @@ the point.
 
 ```mermaid
 flowchart TD
-    X["x in [0,1]^4<br/>normalized design"] --> UN["unnormalize"]
-    UN --> PHYS["tau 0.5-2.0 min<br/>equivalents 1-5<br/>c_in 0.1-0.5 M<br/>T 30-120 C"]
+    X["x in [0,1]^4<br/>what the optimizer picks"] --> UN["rescale to physical units"]
+    UN --> PHYS["<b>tau</b> residence time 0.5-2.0 min<br/><b>equivalents</b> pyrrolidine 1-5<br/><b>c_in</b> inlet concentration 0.1-0.5 M<br/><b>T</b> temperature 30-120 C"]
     PHYS --> RK4["RK4 integration<br/>5-species SNAr kinetics<br/>256 steps"]
     RK4 --> CONC["5 outlet concentrations c<br/>reagent, pyrrolidine, product,<br/>regioisomer, bis-adduct"]
     CONC --> LOG["log(c + 1 uM)<br/><b>transform</b>"]
     LOG --> H["h : 5 log concentrations<br/><b>this is what the GPs model</b>"]
 
     H --> EXP["exp(h) - 1 uM<br/><b>inverse transform</b>"]
-    PHYS -. "tau only, exact" .-> Q["q = V / tau<br/><b>never modelled</b>"]
+    PHYS -. "residence time, known exactly" .-> Q["q = V / tau<br/>flow rate<br/><b>never modelled</b>"]
 
     EXP --> STY["STY = 60 MW_p c_p q / V"]
     Q --> STY
     EXP --> EF["E = (rho + sum MW_i c_i) / (MW_p c_p)"]
 
-    STY --> F1["f1 = 1 - clamp(STY / 13000)"]
-    EF --> F2["f2 = clamp(E, max 1000) / 500"]
+    STY --> F1["<b>space-time yield</b><br/>kg product m-3 h-1<br/><i>maximize</i>"]
+    EF --> F2["<b>E-factor</b><br/>kg waste per kg product<br/><i>minimize</i>"]
 
     style H fill:#e8e0f5,stroke:#7B68B5,stroke-width:2px
     style Q fill:#fbe6da,stroke:#C05A2E,stroke-width:2px
     style LOG fill:#fff4cc,stroke:#c9a227
     style EXP fill:#fff4cc,stroke:#c9a227
+    style F1 fill:#e3f0e3,stroke:#3a7d44
+    style F2 fill:#e3f0e3,stroke:#3a7d44
 ```
 
 Everything below the shaded `h` box is the known map `g`, evaluated exactly on
 Monte Carlo samples of the component posteriors. The direct method skips the
-whole middle and fits two GPs straight from `x` to `f1`, `f2`.
+whole middle and fits two GPs straight from `x` to the two green boxes.
+
+Residence time `tau` appears on two paths because it does two jobs: it drives the
+kinetics — longer residence means more conversion — and it fixes the flow rate
+`q = V / tau`, which is known exactly and so never goes near a GP. The solver
+reports both objectives in a normalized minimize-everything form internally, but
+they are the two quantities named in the green boxes.
 
 Two transforms are worth calling out because they are choices, not physics:
 
@@ -218,7 +226,7 @@ No — and not approximately, but exactly not. Scaling each species by its own
 constant, `c_i -> K_i c_i`, and dividing the `K_i` back out inside `g` reproduces
 the unscaled result to four significant figures for every choice tried:
 
-| representation | advantage | f1 (yield) | f2 (E-factor) |
+| representation | overall | yield | E-factor |
 |---|---:|---:|---:|
 | raw `c`, no scaling | 15.3% | 45.8% | 0.2% |
 | `K_i` equalizing every species median to 1 | 15.3% | 45.8% | 0.2% |
@@ -239,8 +247,9 @@ construction.
 Log is not a rescaling. It is a nonlinear reshaping: it converts multiplicative
 structure into additive structure, so a concentration that varies over decades
 becomes a target with roughly uniform curvature, and — the part that matters
-here — it makes the E-factor's division into a subtraction. That is why f2 moves
-from +0.2% to +25.4% while no amount of constant scaling moves it at all.
+here — it makes the E-factor's division into a subtraction. That is why the
+E-factor moves from +0.2% to +25.4% while no amount of constant scaling moves it
+at all.
 
 If the goal were purely to keep posterior samples positive, other options exist
 (a softplus link, or modelling `sqrt(c)` as DTLZ2 does with its radial term).
