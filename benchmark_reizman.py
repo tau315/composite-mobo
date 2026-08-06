@@ -62,6 +62,15 @@ def compose(H: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     )
 
 
+# A reference point far outside the attainable range hands every method the same
+# large constant slab of hypervolume, which compresses the differences the
+# experiment is trying to measure. Over a 512-point Sobol sweep the objectives
+# span [0.034, 0.682] and [0.297, 0.891], so this sits just past the worst
+# attainable corner: every method still clears it, and none is credited for
+# volume no design can reach.
+REF_POINT = torch.tensor([0.75, 0.95], dtype=torch.double)
+
+
 PROBLEM = BenchmarkProblem(
     name="Reizman-Suzuki cross-coupling (2 objectives, 3 dimensions)",
     slug="reizman_suzuki_2obj_3d",
@@ -71,7 +80,7 @@ PROBLEM = BenchmarkProblem(
     evaluate_components=evaluate_components,
     compose=compose,
     ideal=torch.zeros(2, dtype=torch.double),
-    ref_point=torch.ones(2, dtype=torch.double),
+    ref_point=REF_POINT,
 )
 
 
