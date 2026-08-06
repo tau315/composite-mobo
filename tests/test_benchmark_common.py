@@ -10,6 +10,7 @@ import torch
 from botorch.exceptions.errors import CandidateGenerationError
 
 import benchmark_common
+import diagnose_composite
 import solvers
 from benchmark_common import BenchmarkProblem
 
@@ -781,3 +782,29 @@ def test_batched_morbo_refuses_a_map_it_cannot_supply_inputs_to():
             problem.evaluate, problem.evaluate_components, problem.compose,
             problem.dim, problem.ref_point, n_init=3, n_iter=1,
         )
+
+
+def test_composer_rejects_callables_it_cannot_inspect():
+    """Guessing one-argument would silently drop the exact inputs."""
+
+    with pytest.raises(TypeError, match="cannot be inspected"):
+        solvers.composer(torch.add)
+
+
+def test_composer_supports_a_keyword_only_design_argument():
+    def compose(H, *, X):
+        return H + 0.0 * X.sum()
+
+    assert solvers._accepts_inputs(compose)
+    normalized = solvers.composer(compose)
+    assert normalized(torch.ones(2, 2), torch.ones(2, 2)).shape == (2, 2)
+
+
+def test_screening_reports_spread_and_worst_objective():
+    """A single split can score a problem +46% that another scores -57%."""
+
+    problem = _problem()
+    report = diagnose_composite.diagnose_repeated(problem, seeds=3, n_train=16, n_test=32)
+    assert report["seeds"] == 3
+    assert report["advantage_min"] <= report["advantage"] <= report["advantage_max"]
+    assert report["worst_objective_advantage"] <= report["advantage_max"]

@@ -231,15 +231,25 @@ def _accepts_inputs(compose: Composer) -> bool:
     try:
         parameters = list(inspect.signature(compose).parameters.values())
     except (TypeError, ValueError):
-        return False
+        # A callable whose signature cannot be inspected (many C-implemented
+        # ones) is ambiguous. Treating it as one-argument would silently drop
+        # the exact inputs, so refuse rather than guess.
+        raise TypeError(
+            "compose's signature cannot be inspected; wrap it in a plain "
+            "function declaring compose(H) or compose(H, X)"
+        )
     if any(p.kind is p.VAR_POSITIONAL for p in parameters):
         return True
-    positional = [
+    # A second parameter counts however it is declared: keyword-only still
+    # means the map wants the designs, and calling it positionally would fail.
+    accepting = [
         p
         for p in parameters
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        if p.kind
+        in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        and p.default is p.empty
     ]
-    return len(positional) >= 2
+    return len(accepting) >= 2
 
 
 def composer(compose: Composer) -> Callable[[Tensor, Optional[Tensor]], Tensor]:
@@ -255,9 +265,14 @@ def composer(compose: Composer) -> Callable[[Tensor, Optional[Tensor]], Tensor]:
     Carlo sample dimensions of ``H``.
     """
 
-    if _accepts_inputs(compose):
-        return compose
-    return lambda H, X=None: compose(H)
+    if not _accepts_inputs(compose):
+        return lambda H, X=None: compose(H)
+    parameters = list(inspect.signature(compose).parameters.values())
+    keyword_only = [p for p in parameters if p.kind is p.KEYWORD_ONLY and p.default is p.empty]
+    if keyword_only:
+        name = keyword_only[0].name
+        return lambda H, X=None, _n=name: compose(H, **{_n: X})
+    return compose
 
 
 def _check_composition(

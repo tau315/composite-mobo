@@ -12,9 +12,15 @@ The reported ``advantage`` is the fraction of direct RMSE removed by going
 through g. Positive means the composite surrogate is the better model of f,
 which is a necessary condition for composite BO to win.
 
+**A single split is not enough.** One Sobol seed gave SNAr +45.6%; another gave
+-57.0% on the same problem, because averaging over objectives hid one objective
+improving 43% while the other degraded 110%. Every number here is therefore
+reported across several seeds, with the spread and the per-objective breakdown,
+so an unstable screen cannot pass as a confident one.
+
 Usage:
     python diagnose_composite.py                     # every benchmark
-    python diagnose_composite.py benchmark_dtlz2     # selected modules
+    python diagnose_composite.py benchmark_snar      # selected modules
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ import importlib
 import os
 import sys
 
+import numpy as np
 import torch
 
 from benchmark_common import BenchmarkProblem
@@ -66,8 +73,10 @@ def diagnose(
         component_prediction = component_model.posterior(X_test).mean
         composite_prediction = problem.composed(component_prediction, X_test).double()
 
-    direct_rmse = _standardized_rmse(direct_prediction, Y_test).mean()
-    composite_rmse = _standardized_rmse(composite_prediction, Y_test).mean()
+    direct_per_objective = _standardized_rmse(direct_prediction, Y_test)
+    composite_per_objective = _standardized_rmse(composite_prediction, Y_test)
+    direct_rmse = direct_per_objective.mean()
+    composite_rmse = composite_per_objective.mean()
     component_rmse = _standardized_rmse(component_prediction, C_test).mean()
 
     return {
@@ -78,7 +87,41 @@ def diagnose(
         "composite_rmse": float(composite_rmse),
         "component_rmse": float(component_rmse),
         # Fraction of the direct model's error that routing through g removes.
+        # Clamping the denominator keeps a near-perfect direct model from
+        # turning a negligible absolute difference into a huge ratio.
         "advantage": float(1.0 - composite_rmse / direct_rmse.clamp_min(1e-12)),
+        "per_objective_advantage": [
+            float(1.0 - c / d.clamp_min(1e-12))
+            for d, c in zip(direct_per_objective, composite_per_objective)
+        ],
+    }
+
+
+def diagnose_repeated(
+    problem: BenchmarkProblem,
+    seeds: int = 5,
+    n_train: int = 32,
+    n_test: int = 128,
+) -> dict:
+    """Repeat the screen over independent Sobol splits and report the spread.
+
+    The worst per-objective advantage is reported alongside the mean because a
+    benchmark can look good on average while one objective is badly degraded --
+    which is exactly how a single split reported +45.6% for a problem that
+    another split scored -57.0%.
+    """
+
+    reports = [diagnose(problem, n_train=n_train, n_test=n_test, seed=s) for s in range(seeds)]
+    advantages = np.array([r["advantage"] for r in reports])
+    worst_objective = min(min(r["per_objective_advantage"]) for r in reports)
+    return {
+        **reports[0],
+        "advantage": float(advantages.mean()),
+        "advantage_std": float(advantages.std(ddof=1)) if seeds > 1 else 0.0,
+        "advantage_min": float(advantages.min()),
+        "advantage_max": float(advantages.max()),
+        "worst_objective_advantage": worst_objective,
+        "seeds": seeds,
     }
 
 
@@ -91,19 +134,19 @@ def _benchmark_modules(names: list[str]) -> list[str]:
 
 def main() -> None:
     header = (
-        f"{'benchmark':<30}{'suite':<6}{'d':>6}{'m':>4}{'p':>5}"
-        f"{'direct':>9}{'composite':>11}{'advantage':>11}"
+        f"{'benchmark':<30}{'d':>6}{'m':>4}{'p':>5}"
+        f"{'advantage (mean+-sd)':>22}{'range':>20}{'worst obj':>11}"
     )
     print(header)
     print("-" * len(header))
     for name in _benchmark_modules(sys.argv[1:]):
         problem = importlib.import_module(name).PROBLEM
-        report = diagnose(problem)
+        r = diagnose_repeated(problem)
+        spread = f"[{r['advantage_min']:+.0%}, {r['advantage_max']:+.0%}]"
         print(
-            f"{problem.slug:<30}{problem.suite:<6}{report['dim']:>6}"
-            f"{report['objectives']:>4}{report['components']:>5}"
-            f"{report['direct_rmse']:>9.3f}{report['composite_rmse']:>11.3f}"
-            f"{report['advantage']:>10.1%}",
+            f"{problem.slug:<30}{r['dim']:>6}{r['objectives']:>4}{r['components']:>5}"
+            f"{r['advantage']:>15.1%} +-{r['advantage_std']:>5.1%}"
+            f"{spread:>20}{r['worst_objective_advantage']:>11.1%}",
             flush=True,
         )
 

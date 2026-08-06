@@ -3,8 +3,21 @@
 Working notes backing the paper's "when does composite modeling help" section.
 Every number is the **advantage** reported by `diagnose_composite.py`: the
 fraction of a direct GP's held-out standardized RMSE that is removed by instead
-predicting the objectives through the known map `g`. It needs no BO loop and
-tracks the measured paired BO outcomes.
+predicting the objectives through the known map `g`. It needs no BO loop.
+
+> **Correction (2026-08-06).** The single-split numbers below were unstable and
+> should be read as indicative only. Re-measured across five Sobol splits,
+> Reizman scores 44.9% +- 6.8% (range +39% to +54%) but **SNAr scores
+> 20.2% +- 43.4%, ranging from -57% to +46%** -- one split had a single
+> objective degrade by 110% while the mean concealed it. `diagnose_composite.py`
+> now reports the spread and the worst per-objective advantage for this reason.
+> Screening decisions taken on a single split, including several in this
+> document, rest on weaker evidence than the numbers suggest.
+>
+> Surrogate advantage also did not translate into optimization gain: on the
+> 20-trial campaign, composite led Reizman qLogEHVI by +9.4% at 7 evaluations
+> but only +0.3% at 50, and *lost* Reizman STCH by 1.7% (1/20 wins). An
+> independent review found no bug in the composite STCH path.
 
 ## The criterion
 
