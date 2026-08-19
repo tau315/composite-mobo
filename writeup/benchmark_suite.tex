@@ -3,179 +3,244 @@
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{tabularx}
-\usepackage{xcolor}
 \usepackage{longtable}
+\usepackage{xcolor}
 \usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
 
 \newcommand{\win}[1]{\textcolor{green!45!black}{\textbf{#1}}}
 \newcommand{\loss}[1]{\textcolor{red!60!black}{\textbf{#1}}}
+\newcommand{\gvec}{g(x)}
+\newcommand{\R}{\mathbb{R}}
 
-\title{Composite Multi-Objective Bayesian Optimization:\\Benchmark Suite, Structure, and Results}
+\title{Composite Multi-Objective Bayesian Optimization:\\Benchmark Suite --- Formulations and Results}
 \author{tau315/composite-mobo}
 \date{\today}
 
 \begin{document}
 \maketitle
 
-\section{Overview}
+\section{Setup and notation}
 
-This suite evaluates \emph{composite} multi-objective Bayesian optimization
-(MOBO): instead of fitting a surrogate directly to the objective vector
-$f(x)\in\mathbb{R}^M$, the surrogate models an intermediate \emph{raw
-response} $g(x)\in\mathbb{R}^K$ that a real simulator or solver computes, and
-a \emph{known}, closed-form reduction $L$ recovers the objectives,
+Each benchmark is a deterministic multi-objective minimization problem with
+a \emph{composite} structure
 \[
-    x \;\longrightarrow\; g(x) \;\longrightarrow\; f(x) = L\big(g(x)\big).
+    x \;\longrightarrow\; g(x)\in\R^{K} \;\longrightarrow\; f(x)=L\big(g(x)\big)\in\R^{M},
 \]
-The composite variant of each solver fits $K$ per-component surrogates to
-$g$ and applies $L$ analytically; the direct variant fits $M$ surrogates to
-$f$. Every benchmark below is a controlled A/B: identical objective, Pareto
-front, and evaluation budget; only the surrogate target differs.
+where $g$ is a \emph{raw response} that a real simulator/solver computes and
+$L$ is a \emph{known}, closed-form reduction. The \textbf{composite} variant of
+a solver fits $K$ surrogates to $g$ and applies $L$ analytically; the
+\textbf{direct} variant fits $M$ surrogates to $f$. Inputs are normalized to
+$[0,1]^d$ and mapped to each problem's native bounds.
 
-\paragraph{Solvers.} Each benchmark is run through up to four solver families,
-each in a direct and a composite variant:
-\texttt{standard\_mobo} (qEHVI), \texttt{chebyshev\_bo} (augmented-Chebyshev
-scalarization), \texttt{spherical\_chebyshev\_bo} (a spherical scalarization
-for high dimension), and \texttt{batched\_morbo} (trust-region MORBO).
+\paragraph{Solvers.} \texttt{standard\_mobo} (qEHVI), \texttt{chebyshev\_bo}
+(augmented-Chebyshev scalarization), \texttt{spherical\_chebyshev\_bo}
+(spherical scalarization, high-dim), \texttt{batched\_morbo} (trust-region
+MORBO); each in a direct and composite variant.
+Reported $\Delta$ is the composite-minus-direct percentage change in final
+dominated hypervolume, paired per seed at $n$ seeds ($*$: $p<0.05$, paired
+$t$-test).
 
-\paragraph{Suite gating.} ``Low''-suite benchmarks ($\lesssim 10$D) run
-\texttt{standard\_mobo}/\texttt{chebyshev\_bo}/\texttt{batched\_morbo};
-``high''-suite benchmarks run \texttt{spherical\_chebyshev\_bo}/
-\texttt{batched\_morbo} (plain-kernel scalarization is a weak test at high
-dimension). Reported numbers are the composite-minus-direct percentage change
-in final dominated hypervolume, paired per seed, at $n$ seeds; $*$ marks
-$p<0.05$ (paired $t$-test).
+\section{Synthetic composite benchmarks}
 
-\section{Benchmarks and their composite structure}
+\subsection{DTLZ2 ($M{=}2$; $d\in\{6,100,600\}$)}
+With one position variable $x_0$ and distance variables $x_1,\dots,x_{d-1}$,
+\[
+g = \sum_{j=1}^{d-1}(x_j-0.5)^2,\qquad
+\theta=\tfrac{\pi}{2}x_0,\qquad
+f_1=(1+g)\cos\theta,\ \ f_2=(1+g)\sin\theta .
+\]
+\textbf{Composite:} $g(x)$ exposes the per-variable terms $(x_j-0.5)^2$
+(each a $1$-D function); $L$ sums them to $g$ and applies the trig map.
+\textbf{Result} (\texttt{batched\_morbo}): $d{=}6$ \win{$+5.3\%$*}, $d{=}100$
+\win{$+0.3\%$*}, $d{=}600$ $+0.1\%$. Also $M{=}5$, $d{=}6$: \win{$+0.5\%$*}.
 
-\subsection{Synthetic composite functions}
-These have a decomposable objective by construction and serve as mechanism
-probes.
-\begin{itemize}
-  \item \textbf{DTLZ2} ($6$D/$2$obj, $100$D/$2$obj, $600$D/$2$obj; also a
-  $6$D/$5$obj variant). Objective $f_m = (1+g)\prod\cos(\cdot)$ with
-  $g=\sum_j (x_j-0.5)^2$; the raw response exposes the per-variable distance
-  terms, so $g$ is a sum of one-dimensional components. The canonical
-  decoupled case.
-  \item \textbf{Ackley--Griewank} ($6$D, $50$D / $2$obj),
-  \textbf{Five-Ackley} ($6$D/$5$obj), \textbf{Langermann--Ackley}
-  ($6$D/$2$obj), \textbf{Projected Langermann} ($500$D/$2$obj): additive
-  synthetic multi-objective landscapes whose raw response exposes the
-  additive terms feeding each objective.
-\end{itemize}
+\subsection{Ackley--Griewank ($M{=}2$; $d\in\{6,50\}$)}
+On rotated/shifted coordinates $z=R(x-c)$, the two objectives are a
+normalized Ackley and Griewank. Ackley uses the two intermediates
+$\big(\overline{z^2},\ \overline{\cos 2\pi z}\big)$ with
+\[
+\mathrm{Ackley}= -20\exp\!\big(-0.2\sqrt{\overline{z^2}}\big)-\exp\!\big(\overline{\cos 2\pi z}\big)+20+e ;
+\]
+Griewank uses $\big(\tfrac{1}{4000}\sum z_j^2,\ \prod_j\cos(z_j/\sqrt{j})\big)$
+with $\mathrm{Griewank}=1+\tfrac{1}{4000}\sum z_j^2-\prod_j\cos(z_j/\sqrt{j})$.
+\textbf{Composite:} $g(x)$ exposes these mean/sum/product intermediates; $L$
+is the outer nonlinearity. \textbf{Result:} $d{=}6$ \win{$+2.7\%$*}
+(\texttt{standard}); $d{=}50$ $+0.1\%$ (\texttt{batched\_morbo}).
 
-\subsection{Real-world benchmarks}
-\begin{itemize}
-  \item \textbf{Summit SnAr reactor} ($4$D/$2$obj). Nucleophilic aromatic
-  substitution in a plug-flow reactor (Felton et al. 2021; Hone et al. 2017
-  kinetics). Raw response: the five outlet species concentrations plus the
-  product molar flow; reduction: space-time yield (linear in the product
-  flow) and E-factor (a nonlinear \emph{ratio} of species masses).
-  \item \textbf{Nanoparticle RGB} ($6$D/$3$obj). Mie-scattering multilayer
-  nanoparticle designed for RGB-selective structural color; raw response is
-  the per-wavelength scattering response reduced to three color objectives.
-  \item \textbf{CORT TG119 radiotherapy} ($418$D/$3$obj). Intensity-modulated
-  radiotherapy dose optimization on the TG119 phantom; the raw response is
-  the per-voxel dose, reduced to target-coverage / organ-sparing objectives.
-  \item \textbf{Penicillin fermentation} ($7$D/$3$obj). Fed-batch bioreactor;
-  raw response is a checkpointed fermentation trajectory reduced to yield,
-  CO$_2$, and time.
-\end{itemize}
+\subsection{Five-Ackley ($M{=}5$, $d{=}6$) and Langermann--Ackley ($M{=}2$, $d{=}6$)}
+Multi-objective stacks of the Ackley intermediates above and of the
+generalized Langermann map
+$-\sum_i c_i \exp(-d_i/\pi)\cos(\pi d_i)$ (with $d_i$ squared distances to
+targets). \textbf{Composite:} the per-objective additive terms are the raw
+response. \textbf{Result} (\texttt{batched\_morbo}): Five-Ackley
+\win{$+5.0\%$*}; Langermann--Ackley \win{$+5.1\%$*} (and \win{$+8.0\%$*} on
+\texttt{standard}).
 
-\subsection{Power-flow benchmarks (MOBO-HighDim contribution)}
-Real IEEE 14-bus optimal power flow from the CEC2021 RWCMOP suite. The raw
-response is the per-bus power injection vector, computed by a single
-admittance solve $I=YV,\ S=V\odot\bar I$; because the admittance matrix is
-sparse, each per-bus quantity depends only on its local neighbors, and the
-objectives are decoupled sums over them.
-\begin{itemize}
-  \item \textbf{RCM40} ($34$D/$2$obj): active/reactive power loss.
-  \item \textbf{RCM46} ($34$D/$4$obj): fuel cost, active loss, reactive loss,
-  voltage deviation.
-  \item \textbf{MOOPF-5} ($34$D/$5$obj): RCM46's four objectives plus the
-  Kessel--Glavitsch L-index voltage-stability margin. A \emph{constructed}
-  benchmark (not a CEC2021 case, which max out at RCM46's four objectives),
-  built to test whether more decoupled objectives amplify the composite
-  advantage.
-\end{itemize}
+\subsection{Projected Langermann ($M{=}2$, $d{=}500$)}
+A $500$-D Langermann whose raw response exposes the low-dimensional
+projections feeding the exponential-cosine map. \textbf{Result}
+(\texttt{spherical\_chebyshev}): \win{$+0.5\%$*}.
 
-\subsection{Controlled decoupling benchmark}
-\textbf{Blocked DTLZ2} (\texttt{benchmark\_dtlz2\_blocked\_reference.py}).
-DTLZ2 with the objective, input dimension, and objective count held fixed
-while the distance term $g$ is partitioned into $K=\lceil (d{-}1)/b\rceil$
-contiguous blocks; each raw component is a partial sum over $b$ inputs.
-Because $\sum_i \text{block}_i = g$ for every $b$, the objective is identical
-across the sweep -- only the effective input-dimension of the raw components
-($b/d$) varies, isolating decoupling from all other factors.
+\section{Real-world benchmarks}
 
-\section{Results}
+\subsection{Summit SnAr plug-flow reactor ($M{=}2$, $d{=}4$)}
+Inputs: residence time $\tau$, pyrrolidine equivalents $\rho$, inlet
+concentration $C_0$, temperature $T$. The five species
+$C=(C_{\text{dfnb}},C_{\text{pldn}},C_{\text{prod}},C_{\text{regio}},C_{\text{bis}})$
+evolve under Arrhenius kinetics
+$k_j=0.6\,k_j^{\text{ref}}\exp[-\tfrac{E_{a,j}}{R}(\tfrac{1}{T_K}-\tfrac{1}{T_{\text{ref}}})]$:
+\[
+\begin{aligned}
+\dot C_0 &= -(k_a{+}k_b)C_0C_1, &
+\dot C_2 &= k_aC_0C_1-k_cC_1C_2,\\
+\dot C_1 &= -(k_a{+}k_b)C_0C_1-k_cC_1C_2-k_dC_1C_3, &
+\dot C_3 &= k_aC_0C_1-k_dC_1C_3,\\
+\dot C_4 &= k_cC_1C_2+k_dC_1C_3, & &
+\end{aligned}
+\]
+integrated over $[0,\tau]$ with flow $q=V/\tau$ ($V{=}5$ mL). Objectives:
+\[
+\mathrm{STY}=\tfrac{6\times10^4}{1000}\tfrac{M_2\,C_{\text{prod}}\,q}{V}\ (\text{max}),\qquad
+\mathrm{E}=\frac{q\rho_{\text{EtOH}}+10^{-3}q\sum_{i\neq2}M_iC_i}{10^{-3}M_2C_{\text{prod}}q}\ (\text{min}).
+\]
+\textbf{Composite:} $g(x)=(C,\,F_{\text{prod}})$ with product molar flow
+$F_{\text{prod}}=C_{\text{prod}}q$; STY reads $F_{\text{prod}}$ and $q$ cancels
+in E (leaving a function of $C$ only). \textbf{Result:} \win{$+0.3\%$*}
+(\texttt{batched\_morbo}) --- essentially tied (a coupled 4-D reactor ODE).
 
-\begin{longtable}{@{}lrrl@{}}
+\subsection{Nanoparticle RGB structural color ($M{=}3$, $d{=}6$)}
+Inputs: core radius and five shell thicknesses. Mie scattering is evaluated at
+$201$ visible wavelengths, giving a scattering spectrum $S(\lambda;x)$. Each
+color objective $m\in\{R,G,B\}$ is composed from its in-band and out-of-band
+integrated intensities,
+\[
+I^{\text{in}}_m=\!\!\int_{\text{band }m}\!\!\!S\,d\lambda,\quad
+I^{\text{out}}_m=\!\!\int_{\text{out }m}\!\!\!S\,d\lambda,\qquad
+f_m = L\big(I^{\text{in}}_m,I^{\text{out}}_m\big).
+\]
+\textbf{Composite:} $g(x)=(I^{\text{in}}_m,I^{\text{out}}_m)_{m}$ (the band
+integrals); $L$ forms the selectivity objectives. \textbf{Result:} $+0.2\%$
+(\texttt{standard}) --- tied (a coupled global Mie solve).
+
+\subsection{CORT TG119 radiotherapy ($M{=}3$, $d{=}418$)}
+$418$ beamlet intensities $x\ge0$; public dose-influence matrices $D_s$ per
+structure $s$ give the voxel dose $\mathbf{d}_s=D_s x$. Objectives are
+target-coverage / organ-sparing functionals of the per-voxel doses.
+\textbf{Composite:} $g(x)$ exposes the per-structure dose statistics; $L$ forms
+the three clinical objectives. \textbf{Result:} \win{$+1.5\%$*}
+(\texttt{spherical\_chebyshev}) but \loss{$-2.0\%$*} (\texttt{batched\_morbo})
+--- a sign flip by solver (method dependence).
+
+\subsection{Penicillin fermentation ($M{=}3$, $d{=}7$)}
+A fed-batch bioreactor ODE integrated over the run; the raw response is the
+checkpointed state trajectory $g(x)=\{s(x,t_k)\}_k$, reduced to
+$(\text{yield},\,\mathrm{CO_2},\,\text{time})$. \textbf{Result:}
+\loss{$-2.5\%$*} (\texttt{batched\_morbo}) --- a coupled trajectory of one
+process; composite hurts.
+
+\section{Power-flow benchmarks (MOBO-HighDim contribution)}
+
+Real IEEE 14-bus optimal power flow (CEC2021 RWCMOP). With complex bus
+voltages $V$ (design variables, slack $V_1{=}1$) and sparse admittance
+$Y=G+jB$, one solve gives the per-bus complex power
+\[
+I = Y V,\qquad S = V\odot\bar I,\qquad P_{sp}=\Re(S),\ \ Q_{sp}=\Im(S).
+\]
+Because $Y$ is \emph{sparse}, each $P_{sp,k}$ depends only on bus $k$'s
+neighbors --- the source of decoupling. The raw response is
+$g(x)=(P_{sp},Q_{sp},\dots)$ and objectives are decoupled sums over it.
+
+\subsection{RCM40 ($M{=}2$, $d{=}34$)}
+$f_1=\sum_k P_{sp,k}$ (active loss), $f_2=-\Im(I_2)+\sum_{k\ge2}Q_{sp,k}$
+(reactive loss). \textbf{Result:} \win{$+0.8\%$*} (\texttt{batched\_morbo}).
+
+\subsection{RCM46 ($M{=}4$, $d{=}34$)}
+Adds fuel cost $f_1=\sum_k(b_kP_{g,k}+c_kP_{g,k}^2)$ and voltage deviation
+$f_4=\sum_{k\ge2}(1-|V_k|)^2$ to RCM40's two loss objectives.
+\textbf{Result:} \win{$+5.4\%$*} (\texttt{batched\_morbo}), \win{$+19.0\%$*}
+(\texttt{spherical\_chebyshev}). The win grows from RCM40's $2$ to RCM46's
+$4$ decoupled objectives.
+
+\subsection{MOOPF-5 ($M{=}5$, $d{=}34$; constructed)}
+RCM46's four objectives plus the Kessel--Glavitsch L-index voltage-stability
+margin. Partitioning $Y$ into generator (PV/slack) and load blocks and forming
+$F=-Y_{LL}^{-1}Y_{LG}$,
+\[
+L_j=\Big|\,1-\sum_{i\in\text{gen}}F_{ji}\,\tfrac{V_i}{V_j}\,\Big|,\qquad f_5=\max_{j\in\text{load}}L_j .
+\]
+$g(x)$ appends the per-load-bus $L_j$ to RCM46's response.
+\textbf{Result:} \win{$+23.5\%$*} (\texttt{batched\_morbo}, $n{=}20$),
+\win{$+14.6\%$*} (\texttt{spherical\_chebyshev}) --- the largest win in the
+suite. (Not a CEC2021 case; a constructed benchmark to test whether more
+decoupled objectives amplify the advantage.)
+
+\section{Controlled decoupling benchmark}
+
+\subsection{Blocked DTLZ2 ($M{=}2$, $d{=}49$)}
+DTLZ2 with the objective held fixed while the distance term is exposed as
+$K=\lceil (d{-}1)/b\rceil$ block partial sums,
+\[
+\text{block}_i=\sum_{j\in\text{block }i}(x_j-0.5)^2,\qquad \sum_i\text{block}_i=g\ \ \forall b .
+\]
+The block size $b$ dials the effective input-dimension of each raw component
+($b/d$) from $\sim1/d$ (decoupled) to $1$ (coupled) with everything else
+fixed. \textbf{Result:} composite advantage falls monotonically from
+$+11.9\%$ ($b{=}1$) to $+7.4\%$ ($b{=}48$), Pearson $r=-0.997$
+(\texttt{ablation\_results/\_decoupling\_sweep/}). Causal confirmation that
+decoupling drives the advantage.
+
+\section{Results summary}
+
+\begin{longtable}{@{}llrrl@{}}
 \toprule
-Benchmark (best composite pair) & Dim/Obj & $n$ & Composite $\Delta$HV \\
+Benchmark & Best pair & Dim/Obj & $n$ & $\Delta$HV \\
+\midrule\endhead
+\multicolumn{5}{@{}l}{\textit{Power flow}}\\
+MOOPF-5 & batched\_morbo & 34/5 & 20 & \win{$+23.5\%$*}\\
+MOOPF-5 & spherical & 34/5 & 13 & \win{$+14.6\%$*}\\
+RCM46 & spherical & 34/4 & 18 & \win{$+19.0\%$*}\\
+RCM46 & batched\_morbo & 34/4 & 20 & \win{$+5.4\%$*}\\
+RCM40 & batched\_morbo & 34/2 & 20 & \win{$+0.8\%$*}\\
 \midrule
-\endhead
-\multicolumn{4}{@{}l}{\textit{Power flow (MOBO-HighDim)}}\\
-MOOPF-5 \quad(batched\_morbo)      & 34/5 & 20 & \win{$+23.5\%$*} \\
-\quad\quad(spherical\_chebyshev)   & 34/5 & 13 & \win{$+14.6\%$*} \\
-RCM46 \quad(spherical\_chebyshev)  & 34/4 & 18 & \win{$+19.0\%$*} \\
-\quad\quad(batched\_morbo)         & 34/4 & 20 & \win{$+5.4\%$*} \\
-RCM40 \quad(batched\_morbo)        & 34/2 & 20 & \win{$+0.8\%$*} \\
+\multicolumn{5}{@{}l}{\textit{Synthetic}}\\
+Langermann--Ackley & standard & 6/2 & 20 & \win{$+8.0\%$*}\\
+DTLZ2 & batched\_morbo & 6/2 & 20 & \win{$+5.3\%$*}\\
+Five-Ackley & batched\_morbo & 6/5 & 20 & \win{$+5.0\%$*}\\
+Ackley--Griewank & standard & 6/2 & 20 & \win{$+2.7\%$*}\\
+DTLZ2 & batched\_morbo & 100/2 & 20 & \win{$+0.3\%$*}\\
+DTLZ2 (5obj) & batched\_morbo & 6/5 & 20 & \win{$+0.5\%$*}\\
+Projected Langermann & spherical & 500/2 & 8 & \win{$+0.5\%$*}\\
+DTLZ2 & batched\_morbo & 600/2 & 20 & $+0.1\%$\\
+Ackley--Griewank & batched\_morbo & 50/2 & 20 & $+0.1\%$\\
 \midrule
-\multicolumn{4}{@{}l}{\textit{Synthetic}}\\
-DTLZ2 \quad(batched\_morbo)        & 6/2  & 20 & \win{$+5.3\%$*} \\
-Langermann--Ackley (standard\_mobo)& 6/2  & 20 & \win{$+8.0\%$*} \\
-Five-Ackley (batched\_morbo)       & 6/5  & 20 & \win{$+5.0\%$*} \\
-DTLZ2 (batched\_morbo)             & 100/2& 20 & \win{$+0.3\%$*} \\
-DTLZ2 (5obj) (batched\_morbo)      & 6/5  & 20 & \win{$+0.5\%$*} \\
-DTLZ2 (batched\_morbo)             & 600/2& 20 & $+0.1\%$ \\
-Ackley--Griewank (standard\_mobo)  & 6/2  & 20 & \win{$+2.7\%$*} \\
-Ackley--Griewank (batched\_morbo)  & 50/2 & 20 & $+0.1\%$ \\
-Projected Langermann (spherical)   & 500/2& 8  & \win{$+0.5\%$*} \\
-\midrule
-\multicolumn{4}{@{}l}{\textit{Real-world (chemistry / physics / medical)}}\\
-Nanoparticle RGB (standard\_mobo)  & 6/3  & 20 & $+0.2\%$ \\
-Summit SnAr (batched\_morbo)       & 4/2  & 20 & \win{$+0.3\%$*} \\
-Penicillin (batched\_morbo)        & 7/3  & 20 & \loss{$-2.5\%$*} \\
-CORT TG119 (spherical\_chebyshev)  & 418/3& 20 & \win{$+1.5\%$*} \\
-\quad\quad(batched\_morbo)         & 418/3& 20 & \loss{$-2.0\%$*} \\
+\multicolumn{5}{@{}l}{\textit{Real-world (chem / optics / medical / bio)}}\\
+CORT TG119 & spherical & 418/3 & 20 & \win{$+1.5\%$*}\\
+CORT TG119 & batched\_morbo & 418/3 & 20 & \loss{$-2.0\%$*}\\
+Summit SnAr & batched\_morbo & 4/2 & 20 & \win{$+0.3\%$*}\\
+Nanoparticle RGB & standard & 6/3 & 20 & $+0.2\%$\\
+Penicillin & batched\_morbo & 7/3 & 20 & \loss{$-2.5\%$*}\\
 \bottomrule
 \caption{Composite-minus-direct final-hypervolume change, best/most-complete
-solver pair per benchmark. $*$: $p<0.05$, paired $t$-test.}
+solver pair per benchmark.}
 \end{longtable}
 
 \section{Key findings}
-
 \begin{enumerate}
-  \item \textbf{The largest wins are on decoupled power-flow problems, and
-  scale with objective count.} On the identical IEEE 14-bus system the
-  composite advantage grows RCM40 ($+0.8\%$, 2 obj) $\to$ RCM46 ($+5.4\%$,
-  4 obj) $\to$ MOOPF-5 ($+23.5\%$, 5 obj). Each added decoupled objective
-  handicaps direct modeling (more coupled surrogates) more than composite.
-
-  \item \textbf{Method dependence is real.} CORT TG119 flips sign by solver:
-  composite \emph{loses} $-2.0\%$ on \texttt{batched\_morbo} but \emph{wins}
-  $+1.5\%$ on \texttt{spherical\_chebyshev\_bo}. The composite advantage is
-  strongest with trust-region acquisition and weakest with plain
-  scalarization.
-
-  \item \textbf{Chemistry / trajectory benchmarks do not benefit.} SnAr
-  ($\approx$tie), Penicillin ($-2.5\%$), and CORT-on-morbo are cases where the
-  raw response is one globally-coupled state (a reaction/fermentation
-  trajectory, a global dose solve); the intermediates are no easier to model
-  than the objectives.
-
-  \item \textbf{Decoupling, not reduction nonlinearity, is the discriminator.}
-  RCM46 wins with a purely \emph{linear} reduction (sums), while SnAr's
-  \emph{nonlinear} E-factor ratio still ties. Across the suite, the effective
-  input-dimension of the raw response separates wins from losses.
-
-  \item \textbf{Causal confirmation (blocked DTLZ2).} Holding the objective,
-  dimension, and objective count fixed and varying only the raw-response block
-  size, the composite advantage falls monotonically from $+11.9\%$ (fully
-  decoupled) to $+7.4\%$ (fully coupled), Pearson $r=-0.997$
-  (Figure in \texttt{ablation\_results/\_decoupling\_sweep/}). Decoupling
-  \emph{causes} the advantage; it is not merely correlated with it.
+  \item \textbf{Wins scale with decoupled-objective count} on the identical
+  IEEE 14-bus system: RCM40 ($+0.8\%$) $\to$ RCM46 ($+5.4\%$) $\to$ MOOPF-5
+  ($+23.5\%$).
+  \item \textbf{Method dependence:} CORT flips sign between
+  \texttt{batched\_morbo} ($-2.0\%$) and \texttt{spherical\_chebyshev}
+  ($+1.5\%$); the advantage is strongest with trust-region acquisition.
+  \item \textbf{Chemistry / trajectory / global-solve benchmarks do not
+  benefit} (SnAr, Penicillin, CORT-on-morbo): the raw response is one
+  globally-coupled state, no easier to model than the objective.
+  \item \textbf{Decoupling, not reduction nonlinearity, is the discriminator:}
+  RCM46 wins with a linear reduction while SnAr's nonlinear E-factor ratio
+  ties. The effective input-dimension of $g$ separates wins from losses.
+  \item \textbf{Causal confirmation (blocked DTLZ2):} varying only the
+  raw-response effective dimension moves the advantage monotonically,
+  $r=-0.997$.
 \end{enumerate}
 
 \end{document}
