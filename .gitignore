@@ -23,6 +23,7 @@ dist/
 *.egg-info/
 
 # Generated benchmark results
+benchmark_results/
 hypervolume_vs_evaluations*.png
 hypervolume_*.png
 smoke_*.png

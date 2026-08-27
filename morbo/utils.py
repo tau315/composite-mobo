@@ -684,7 +684,6 @@ def get_fitted_model(
         ceiling that ~99/100 of a fitted d=100 model's lengthscales pin
         against (the direct input to ard_box's region collapse).
     """
-    print("Fitting a model")
     use_fast_mvms = True if X.shape[0] > max_cholesky_size else False
     with gpytorch_settings.fast_computations(
         log_prob=use_fast_mvms,

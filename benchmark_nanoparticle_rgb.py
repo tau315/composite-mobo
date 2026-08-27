@@ -56,17 +56,20 @@ def _matrix_product(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     )
 
 
-def _mie_spectrum(normalized_X: np.ndarray) -> np.ndarray:
+def _mie_spectrum(
+    normalized_X: np.ndarray, wavelengths: np.ndarray = WAVELENGTHS
+) -> np.ndarray:
     """Return exact normalized scattering spectra for a batch of designs."""
 
     thicknesses = 30.0 + 40.0 * np.asarray(normalized_X, dtype=np.float64)
+    wavelengths = np.asarray(wavelengths, dtype=np.float64)
     n_designs = len(thicknesses)
-    n_wavelengths = len(WAVELENGTHS)
-    omega = 2.0 * np.pi / WAVELENGTHS
+    n_wavelengths = len(wavelengths)
+    omega = 2.0 * np.pi / wavelengths
 
     permittivity = np.empty((DIM + 1, n_wavelengths), dtype=np.float64)
     titanium_dioxide = 5.913 + 0.2441 / (
-        WAVELENGTHS**2 * 1.0e-6 - 0.0803
+        wavelengths**2 * 1.0e-6 - 0.0803
     )
     for layer in range(DIM):
         permittivity[layer] = 2.04 if layer % 2 == 0 else titanium_dioxide

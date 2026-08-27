@@ -1,246 +1,1280 @@
-\documentclass[11pt]{article}
-\usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb}
+\documentclass{article}
+
+% AI4Mat @ NeurIPS 2026 double-blind workshop submission.
+% This manuscript is intended as a full-length submission.
+\usepackage[dblblindworkshop]{neurips_2026}
+\workshoptitle{AI for Accelerated Materials Design (AI4Mat)}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,mathtools}
 \usepackage{booktabs}
-\usepackage{tabularx}
-\usepackage{longtable}
+\usepackage{graphicx}
 \usepackage{xcolor}
-\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
 
-\newcommand{\win}[1]{\textcolor{green!45!black}{\textbf{#1}}}
-\newcommand{\loss}[1]{\textcolor{red!60!black}{\textbf{#1}}}
-\newcommand{\gvec}{g(x)}
 \newcommand{\R}{\mathbb{R}}
+\newcommand{\HV}{\operatorname{HV}}
+\newcommand{\cf}{\mathrm{CF}}
+\newcommand{\direct}{\mathrm{direct}}
+\newcommand{\composemap}{\ell}
+\newcommand{\resultplot}[2][]{%
+  \includegraphics[#1]{#2}%
+}
 
-\title{Composite Multi-Objective Bayesian Optimization:\\Benchmark Suite --- Formulations and Results}
-\author{tau315/composite-mobo}
-\date{\today}
+\title{Composite Multi-Objective Bayesian Optimization for Scientific Design: An Application Study}
+\author{}
 
 \begin{document}
 \maketitle
 
-\section{Setup and notation}
+\begin{abstract}
+Scientific design seeks materials, formulations, and processes that balance
+competing goals, such as improving performance while reducing cost or
+environmental impact.  Finding these tradeoffs is difficult because experiments
+and simulations are expensive, their input--output relationships are unknown,
+and their design spaces can be high-dimensional.  Multi-objective Bayesian
+optimization (MOBO) addresses this problem by using past evaluations to decide
+what to test next.  However, a scientific evaluation often produces a rich
+response---such as a spectrum, trajectory, or set of physical
+contributions---before that response is reduced to a few final scores.  Most
+MOBO methods model only those scores and discard the intermediate information.
+Bayesian optimization of composite functions (BOCF) was originally developed
+for scalar objectives.  We apply the same principle to multi-objective
+scientific design: model the observed response, pass posterior samples through
+the known scientific reduction, and use the resulting objective samples inside
+an existing MOBO method.  This is an application study rather than a new
+acquisition method.  We compare direct and composite representations across
+four MOBO approaches on two synthetic and three scientific benchmarks, with
+two objectives and input dimensions ranging from 4 to 600.  The suite is
+defined by an equal-score/different-sensitivity criterion: two distinct
+intermediate responses can receive the same final score while responding
+differently to a small component change.  Under matched evaluation budgets,
+composite modeling achieves higher mean final hypervolume in all ten
+method--benchmark comparisons, with a median relative gain of 6.98\%.
+Preserving information already produced by an experiment can therefore improve
+scientific search without requiring additional physical evaluations.
+\end{abstract}
 
-Each benchmark is a deterministic multi-objective minimization problem with
-a \emph{composite} structure
-\[
-    x \;\longrightarrow\; g(x)\in\R^{K} \;\longrightarrow\; f(x)=L\big(g(x)\big)\in\R^{M},
-\]
-where $g$ is a \emph{raw response} that a real simulator/solver computes and
-$L$ is a \emph{known}, closed-form reduction. The \textbf{composite} variant of
-a solver fits $K$ surrogates to $g$ and applies $L$ analytically; the
-\textbf{direct} variant fits $M$ surrogates to $f$. Inputs are normalized to
-$[0,1]^d$ and mapped to each problem's native bounds.
+\section{Introduction}
+\label{sec:introduction}
 
-\paragraph{Solvers.} \texttt{standard\_mobo} (qEHVI), \texttt{chebyshev\_bo}
-(augmented-Chebyshev scalarization), \texttt{spherical\_chebyshev\_bo}
-(spherical scalarization, high-dim), \texttt{batched\_morbo} (trust-region
-MORBO); each in a direct and composite variant.
-Reported $\Delta$ is the composite-minus-direct percentage change in final
-dominated hypervolume, paired per seed at $n$ seeds ($*$: $p<0.05$, paired
-$t$-test).
+Scientific design is the task of choosing experimental or engineering
+parameters that produce systems with desired properties.  It is central to
+materials discovery, chemical formulation, and process optimization, and it is
+a core function of autonomous laboratories that connect computational design,
+automated synthesis, and characterization
+\cite{lookman2019active,stach2021autonomous}.  These applications rarely have a
+single goal.  A useful design may need to balance activity and stability,
+optical response and manufacturability, or performance and environmental cost.
+The scientific output is therefore a set of useful tradeoffs rather than one
+best design.
 
-\section{Synthetic composite benchmarks}
+The challenge is that scientific evaluations are expensive and the relation
+between design choices and measured properties is usually unknown.  A
+formulation experiment, for example, may vary several ingredient
+concentrations, require physical preparation, and return a noisy spectrum only
+after substantial laboratory time.  The number of possible formulations grows
+quickly with the number of ingredients, while only a small fraction can be
+tested.  Similar cost and dimensionality constraints occur in simulation-based
+mechanics, ecosystem control, and materials processing.
 
-\subsection{DTLZ2 ($M{=}2$; $d\in\{6,100,600\}$)}
-With one position variable $x_0$ and distance variables $x_1,\dots,x_{d-1}$,
-\[
-g = \sum_{j=1}^{d-1}(x_j-0.5)^2,\qquad
-\theta=\tfrac{\pi}{2}x_0,\qquad
-f_1=(1+g)\cos\theta,\ \ f_2=(1+g)\sin\theta .
-\]
-\textbf{Composite:} $g(x)$ exposes the per-variable terms $(x_j-0.5)^2$
-(each a $1$-D function); $L$ sums them to $g$ and applies the trig map.
-\textbf{Result} (\texttt{batched\_morbo}): $d{=}6$ \win{$+5.3\%$*}, $d{=}100$
-\win{$+0.3\%$*}, $d{=}600$ $+0.1\%$. Also $M{=}5$, $d{=}6$: \win{$+0.5\%$*}.
+Bayesian optimization addresses this setting by building a probabilistic model
+from previous evaluations and using it to choose the next experiment
+\cite{shahriari2016taking,frazier2018tutorial}.  Its multi-objective extension
+(MOBO) seeks a Pareto set of designs for which no objective can be improved
+without worsening another.  MOBO has consequently become important in
+materials design and self-driving laboratories
+\cite{gopakumar2018multiobjective,low2024constrained,macleod2022selfdriving}.
 
-\subsection{Ackley--Griewank ($M{=}2$; $d\in\{6,50\}$)}
-On rotated/shifted coordinates $z=R(x-c)$, the two objectives are a
-normalized Ackley and Griewank. Ackley uses the two intermediates
-$\big(\overline{z^2},\ \overline{\cos 2\pi z}\big)$ with
-\[
-\mathrm{Ackley}= -20\exp\!\big(-0.2\sqrt{\overline{z^2}}\big)-\exp\!\big(\overline{\cos 2\pi z}\big)+20+e ;
-\]
-Griewank uses $\big(\tfrac{1}{4000}\sum z_j^2,\ \prod_j\cos(z_j/\sqrt{j})\big)$
-with $\mathrm{Griewank}=1+\tfrac{1}{4000}\sum z_j^2-\prod_j\cos(z_j/\sqrt{j})$.
-\textbf{Composite:} $g(x)$ exposes these mean/sum/product intermediates; $L$
-is the outer nonlinearity. \textbf{Result:} $d{=}6$ \win{$+2.7\%$*}
-(\texttt{standard}); $d{=}50$ $+0.1\%$ (\texttt{batched\_morbo}).
+High-dimensional design spaces make this search harder because both the
+predictive model and the selection of new experiments become less reliable.
+The methods studied here represent two scalable responses.  Spherical-linear
+models use a compact geometric representation, while MORBO coordinates several
+local trust regions instead of fitting one global search model
+\cite{doumont2026linear,daulton2022morbo}.
 
-\subsection{Five-Ackley ($M{=}5$, $d{=}6$) and Langermann--Ackley ($M{=}2$, $d{=}6$)}
-Multi-objective stacks of the Ackley intermediates above and of the
-generalized Langermann map
-$-\sum_i c_i \exp(-d_i/\pi)\cos(\pi d_i)$ (with $d_i$ squared distances to
-targets). \textbf{Composite:} the per-objective additive terms are the raw
-response. \textbf{Result} (\texttt{batched\_morbo}): Five-Ackley
-\win{$+5.0\%$*}; Langermann--Ackley \win{$+5.1\%$*} (and \win{$+8.0\%$*} on
-\texttt{standard}).
+Scalarization provides a complementary way to handle several objectives.  It
+turns different preferences among the objectives into a sequence of
+single-objective searches.  Smooth Tchebycheff scalarization can therefore be
+paired with both conventional and high-dimensional Bayesian optimization
+\cite{lin2024smooth}.  Hypervolume-based methods instead select designs by how
+much they are expected to expand the currently observed tradeoff region
+\cite{daulton2020differentiable,ament2023unexpected}.  We study both families
+because composite modeling should be tested as a representation choice rather
+than as a feature of only one acquisition rule.
 
-\subsection{Projected Langermann ($M{=}2$, $d{=}500$)}
-A $500$-D Langermann whose raw response exposes the low-dimensional
-projections feeding the exponential-cosine map. \textbf{Result}
-(\texttt{spherical\_chebyshev}): \win{$+0.5\%$*}.
+The key observation is that many scientific objectives are not measured
+directly.  An experiment or simulator first returns a richer intermediate
+response---a spectrum, trajectory, field, or collection of physical
+contributions---and a known calculation reduces that response to the final
+objectives.  Bayesian optimization of composite functions (BOCF) was introduced
+for this setting with one scalar objective: model the intermediate response and
+apply the known scalar reduction inside expected improvement
+\cite{astudillo2019bayesian}.  Scientific design, however, often requires
+several competing objectives computed from the same response.  Multi-objective
+BOCF (MOBOCF) applies the same modeling idea before a multi-objective
+acquisition or scalarization.  It changes the statistical representation, not
+the experiment, and can use more of the information that a scientific
+evaluation already provides.
 
-\section{Real-world benchmarks}
+The central criterion is equal score but different sensitivity.  Two distinct
+intermediate responses may produce the same final objectives yet respond
+differently when one component changes.  A final-objective model receives the
+same response target for both states, although they imply different routes to
+improvement.  This happens naturally with norms, products, oscillatory maps,
+and maxima.  MOBOCF is
+expected to help when such pairs occur and the intermediate response is easier
+to learn than the reduced objective.  A decomposition alone is not enough: an
+additive reduction with constant sensitivity provides a useful boundary case.
 
-\subsection{Summit SnAr plug-flow reactor ($M{=}2$, $d{=}4$)}
-Inputs: residence time $\tau$, pyrrolidine equivalents $\rho$, inlet
-concentration $C_0$, temperature $T$. The five species
-$C=(C_{\text{dfnb}},C_{\text{pldn}},C_{\text{prod}},C_{\text{regio}},C_{\text{bis}})$
-evolve under Arrhenius kinetics
-$k_j=0.6\,k_j^{\text{ref}}\exp[-\tfrac{E_{a,j}}{R}(\tfrac{1}{T_K}-\tfrac{1}{T_{\text{ref}}})]$:
-\[
-\begin{aligned}
-\dot C_0 &= -(k_a{+}k_b)C_0C_1, &
-\dot C_2 &= k_aC_0C_1-k_cC_1C_2,\\
-\dot C_1 &= -(k_a{+}k_b)C_0C_1-k_cC_1C_2-k_dC_1C_3, &
-\dot C_3 &= k_aC_0C_1-k_dC_1C_3,\\
-\dot C_4 &= k_cC_1C_2+k_dC_1C_3, & &
-\end{aligned}
-\]
-integrated over $[0,\tau]$ with flow $q=V/\tau$ ($V{=}5$ mL). Objectives:
-\[
-\mathrm{STY}=\tfrac{6\times10^4}{1000}\tfrac{M_2\,C_{\text{prod}}\,q}{V}\ (\text{max}),\qquad
-\mathrm{E}=\frac{q\rho_{\text{EtOH}}+10^{-3}q\sum_{i\neq2}M_iC_i}{10^{-3}M_2C_{\text{prod}}q}\ (\text{min}).
-\]
-\textbf{Composite:} $g(x)=(C,\,F_{\text{prod}})$ with product molar flow
-$F_{\text{prod}}=C_{\text{prod}}q$; STY reads $F_{\text{prod}}$ and $q$ cancels
-in E (leaving a function of $C$ only). \textbf{Result:} \win{$+0.3\%$*}
-(\texttt{batched\_morbo}) --- essentially tied (a coupled 4-D reactor ODE).
+Prior studies have already demonstrated composite optimization with
+multi-objective material and structural design, smooth Tchebycheff
+scalarization, and high-dimensional optical design
+\cite{coelho2025composite,pires2026composite,maddox2021physics}.  Building on
+those methods, this paper is an application-focused investigation across four
+established MOBO approaches and several scientific computation graphs.  We do
+not propose a new acquisition function.  For each method, we compare an
+objective-only model with a composite model while holding the initial designs,
+acquisition rule, and expensive-evaluation budget fixed.  The study asks when
+preserving intermediate scientific information improves tradeoff discovery in
+low- and high-dimensional applications.
 
-\subsection{Nanoparticle RGB structural color ($M{=}3$, $d{=}6$)}
-Inputs: core radius and five shell thicknesses. Mie scattering is evaluated at
-$201$ visible wavelengths, giving a scattering spectrum $S(\lambda;x)$. Each
-color objective $m\in\{R,G,B\}$ is composed from its in-band and out-of-band
-integrated intensities,
-\[
-I^{\text{in}}_m=\!\!\int_{\text{band }m}\!\!\!S\,d\lambda,\quad
-I^{\text{out}}_m=\!\!\int_{\text{out }m}\!\!\!S\,d\lambda,\qquad
-f_m = L\big(I^{\text{in}}_m,I^{\text{out}}_m\big).
-\]
-\textbf{Composite:} $g(x)=(I^{\text{in}}_m,I^{\text{out}}_m)_{m}$ (the band
-integrals); $L$ forms the selectivity objectives. \textbf{Result:} $+0.2\%$
-(\texttt{standard}) --- tied (a coupled global Mie solve).
-
-\subsection{CORT TG119 radiotherapy ($M{=}3$, $d{=}418$)}
-$418$ beamlet intensities $x\ge0$; public dose-influence matrices $D_s$ per
-structure $s$ give the voxel dose $\mathbf{d}_s=D_s x$. Objectives are
-target-coverage / organ-sparing functionals of the per-voxel doses.
-\textbf{Composite:} $g(x)$ exposes the per-structure dose statistics; $L$ forms
-the three clinical objectives. \textbf{Result:} \win{$+1.5\%$*}
-(\texttt{spherical\_chebyshev}) but \loss{$-2.0\%$*} (\texttt{batched\_morbo})
---- a sign flip by solver (method dependence).
-
-\subsection{Penicillin fermentation ($M{=}3$, $d{=}7$)}
-A fed-batch bioreactor ODE integrated over the run; the raw response is the
-checkpointed state trajectory $g(x)=\{s(x,t_k)\}_k$, reduced to
-$(\text{yield},\,\mathrm{CO_2},\,\text{time})$. \textbf{Result:}
-\loss{$-2.5\%$*} (\texttt{batched\_morbo}) --- a coupled trajectory of one
-process; composite hurts.
-
-\section{Power-flow benchmarks (MOBO-HighDim contribution)}
-
-Real IEEE 14-bus optimal power flow (CEC2021 RWCMOP). With complex bus
-voltages $V$ (design variables, slack $V_1{=}1$) and sparse admittance
-$Y=G+jB$, one solve gives the per-bus complex power
-\[
-I = Y V,\qquad S = V\odot\bar I,\qquad P_{sp}=\Re(S),\ \ Q_{sp}=\Im(S).
-\]
-Because $Y$ is \emph{sparse}, each $P_{sp,k}$ depends only on bus $k$'s
-neighbors --- the source of decoupling. The raw response is
-$g(x)=(P_{sp},Q_{sp},\dots)$ and objectives are decoupled sums over it.
-
-\subsection{RCM40 ($M{=}2$, $d{=}34$)}
-$f_1=\sum_k P_{sp,k}$ (active loss), $f_2=-\Im(I_2)+\sum_{k\ge2}Q_{sp,k}$
-(reactive loss). \textbf{Result:} \win{$+0.8\%$*} (\texttt{batched\_morbo}).
-
-\subsection{RCM46 ($M{=}4$, $d{=}34$)}
-Adds fuel cost $f_1=\sum_k(b_kP_{g,k}+c_kP_{g,k}^2)$ and voltage deviation
-$f_4=\sum_{k\ge2}(1-|V_k|)^2$ to RCM40's two loss objectives.
-\textbf{Result:} \win{$+5.4\%$*} (\texttt{batched\_morbo}), \win{$+19.0\%$*}
-(\texttt{spherical\_chebyshev}). The win grows from RCM40's $2$ to RCM46's
-$4$ decoupled objectives.
-
-\subsection{MOOPF-5 ($M{=}5$, $d{=}34$; constructed)}
-RCM46's four objectives plus the Kessel--Glavitsch L-index voltage-stability
-margin. Partitioning $Y$ into generator (PV/slack) and load blocks and forming
-$F=-Y_{LL}^{-1}Y_{LG}$,
-\[
-L_j=\Big|\,1-\sum_{i\in\text{gen}}F_{ji}\,\tfrac{V_i}{V_j}\,\Big|,\qquad f_5=\max_{j\in\text{load}}L_j .
-\]
-$g(x)$ appends the per-load-bus $L_j$ to RCM46's response.
-\textbf{Result:} \win{$+23.5\%$*} (\texttt{batched\_morbo}, $n{=}20$),
-\win{$+14.6\%$*} (\texttt{spherical\_chebyshev}) --- the largest win in the
-suite. (Not a CEC2021 case; a constructed benchmark to test whether more
-decoupled objectives amplify the advantage.)
-
-\section{Controlled decoupling benchmark}
-
-\subsection{Blocked DTLZ2 ($M{=}2$, $d{=}49$)}
-DTLZ2 with the objective held fixed while the distance term is exposed as
-$K=\lceil (d{-}1)/b\rceil$ block partial sums,
-\[
-\text{block}_i=\sum_{j\in\text{block }i}(x_j-0.5)^2,\qquad \sum_i\text{block}_i=g\ \ \forall b .
-\]
-The block size $b$ dials the effective input-dimension of each raw component
-($b/d$) from $\sim1/d$ (decoupled) to $1$ (coupled) with everything else
-fixed. \textbf{Result:} composite advantage falls monotonically from
-$+11.9\%$ ($b{=}1$) to $+7.4\%$ ($b{=}48$), Pearson $r=-0.997$
-(\texttt{ablation\_results/\_decoupling\_sweep/}). Causal confirmation that
-decoupling drives the advantage.
-
-\section{Results summary}
-
-\begin{longtable}{@{}llrrl@{}}
-\toprule
-Benchmark & Best pair & Dim/Obj & $n$ & $\Delta$HV \\
-\midrule\endhead
-\multicolumn{5}{@{}l}{\textit{Power flow}}\\
-MOOPF-5 & batched\_morbo & 34/5 & 20 & \win{$+23.5\%$*}\\
-MOOPF-5 & spherical & 34/5 & 13 & \win{$+14.6\%$*}\\
-RCM46 & spherical & 34/4 & 18 & \win{$+19.0\%$*}\\
-RCM46 & batched\_morbo & 34/4 & 20 & \win{$+5.4\%$*}\\
-RCM40 & batched\_morbo & 34/2 & 20 & \win{$+0.8\%$*}\\
-\midrule
-\multicolumn{5}{@{}l}{\textit{Synthetic}}\\
-Langermann--Ackley & standard & 6/2 & 20 & \win{$+8.0\%$*}\\
-DTLZ2 & batched\_morbo & 6/2 & 20 & \win{$+5.3\%$*}\\
-Five-Ackley & batched\_morbo & 6/5 & 20 & \win{$+5.0\%$*}\\
-Ackley--Griewank & standard & 6/2 & 20 & \win{$+2.7\%$*}\\
-DTLZ2 & batched\_morbo & 100/2 & 20 & \win{$+0.3\%$*}\\
-DTLZ2 (5obj) & batched\_morbo & 6/5 & 20 & \win{$+0.5\%$*}\\
-Projected Langermann & spherical & 500/2 & 8 & \win{$+0.5\%$*}\\
-DTLZ2 & batched\_morbo & 600/2 & 20 & $+0.1\%$\\
-Ackley--Griewank & batched\_morbo & 50/2 & 20 & $+0.1\%$\\
-\midrule
-\multicolumn{5}{@{}l}{\textit{Real-world (chem / optics / medical / bio)}}\\
-CORT TG119 & spherical & 418/3 & 20 & \win{$+1.5\%$*}\\
-CORT TG119 & batched\_morbo & 418/3 & 20 & \loss{$-2.0\%$*}\\
-Summit SnAr & batched\_morbo & 4/2 & 20 & \win{$+0.3\%$*}\\
-Nanoparticle RGB & standard & 6/3 & 20 & $+0.2\%$\\
-Penicillin & batched\_morbo & 7/3 & 20 & \loss{$-2.5\%$*}\\
-\bottomrule
-\caption{Composite-minus-direct final-hypervolume change, best/most-complete
-solver pair per benchmark.}
-\end{longtable}
-
-\section{Key findings}
+Our contributions are:
 \begin{enumerate}
-  \item \textbf{Wins scale with decoupled-objective count} on the identical
-  IEEE 14-bus system: RCM40 ($+0.8\%$) $\to$ RCM46 ($+5.4\%$) $\to$ MOOPF-5
-  ($+23.5\%$).
-  \item \textbf{Method dependence:} CORT flips sign between
-  \texttt{batched\_morbo} ($-2.0\%$) and \texttt{spherical\_chebyshev}
-  ($+1.5\%$); the advantage is strongest with trust-region acquisition.
-  \item \textbf{Chemistry / trajectory / global-solve benchmarks do not
-  benefit} (SnAr, Penicillin, CORT-on-morbo): the raw response is one
-  globally-coupled state, no easier to model than the objective.
-  \item \textbf{Decoupling, not reduction nonlinearity, is the discriminator:}
-  RCM46 wins with a linear reduction while SnAr's nonlinear E-factor ratio
-  ties. The effective input-dimension of $g$ separates wins from losses.
-  \item \textbf{Causal confirmation (blocked DTLZ2):} varying only the
-  raw-response effective dimension moves the advantage monotonically,
-  $r=-0.997$.
+    \item We apply composite modeling within four existing MOBO approaches that
+    cover hypervolume, scalarization, high-dimensional, and trust-region search.
+    \item We assemble scientific and controlled synthetic applications around
+    an equal-score/different-sensitivity criterion, with an additive boundary
+    case.
+    \item We isolate surrogate representation with paired initial designs and
+    matched expensive-evaluation budgets, then evaluate final hypervolume,
+    complete learning curves, and computational overhead across ten trials.
+    \item We translate the comparisons into practical guidance about when a
+    scientific workflow should retain and model its intermediate response.
 \end{enumerate}
+
+The experiments contain two controlled synthetic benchmarks and three
+deterministic scientific simulators.  All have two objectives; their input
+dimensions range from 4 to 600.  The low-dimensional study compares qLogEHVI
+and smooth Tchebycheff search, while the high-dimensional study compares
+spherical-linear Tchebycheff search and MORBO.  Across ten independent paired
+trials, composite modeling improves all ten mean final hypervolumes.  The median
+relative final gain is 6.98\%, with the largest benefits on strong instances of
+the equal-score/different-sensitivity criterion.
+
+
+\section{Related work}
+\label{sec:related}
+
+Bayesian optimization uses a probabilistic surrogate and an acquisition
+function to allocate expensive evaluations \cite{shahriari2016taking,frazier2018tutorial}.
+Modern MOBO methods either optimize an indicator such as dominated hypervolume
+or repeatedly optimize scalar preferences.  Differentiable Monte Carlo
+expected hypervolume improvement (qEHVI) \cite{daulton2020differentiable} and
+its numerically stable logarithmic form \cite{ament2023unexpected} provide the
+first route.  ParEGO \cite{knowles2006parego} and smooth Tchebycheff (STCH)
+scalarization \cite{lin2024smooth} provide the second.  MORBO coordinates
+multiple local trust regions to make Pareto discovery viable in high input
+dimension \cite{daulton2022morbo}.  Recent work also shows that a geometric
+warping followed by a linear kernel can be unexpectedly competitive in very
+high dimensions \cite{doumont2026linear}.
+
+BOCF instead models $h$ and induces a generally non-Gaussian posterior over
+$\composemap(h)$.  Astudillo and Frazier introduced this idea for a single
+scalar objective and developed expected improvement for composite functions
+\cite{astudillo2019bayesian}; function-network models extend the same
+single-objective principle to more general directed computations
+\cite{astudillo2021networks}.  Structured-output models later showed that
+composite BO can scale to responses with thousands of correlated entries
+\cite{maddox2021outputs}.  Constrained composite BO has also been validated in
+wet-lab polymer-particle synthesis, again for target-oriented scalar
+optimization \cite{wang2025constrained}.
+
+The extension to several competing objectives is newer but not absent.
+Cardoso Coelho et al. study composite surrogates in multi-objective material
+and structural design \cite{coelho2025composite}; Pires et al. combine
+composite models with smooth Tchebycheff scalarization
+\cite{pires2026composite}; and Maddox et al. combine a structured-output model
+with MORBO for a 177-dimensional, two-objective diffractive-optics application
+\cite{maddox2021physics}.  These works establish that MOBOCF can be implemented
+with several surrogate and acquisition designs.  The present paper therefore
+does not introduce composite qEHVI, STCH, or MORBO.  It contributes an
+application-focused, matched evaluation: we apply the same representation
+change across four existing MOBO regimes on scientific computation graphs
+chosen by a common structural criterion.
+
+\section{Problem setting}
+\label{sec:problem}
+
+This section defines the objective structure, observation assumptions, and
+optimization goal used throughout the study.  We consider deterministic
+minimization on a normalized design box
+$\mathcal X=[0,1]^d$:
+\begin{equation}
+  \min_{x\in\mathcal X} f(x)
+  =\min_{x\in\mathcal X}\composemap(h(x)),
+  \qquad h:\mathcal X\rightarrow\R^K,
+  \quad \composemap:\R^K\rightarrow\R^M.
+  \label{eq:problem}
+\end{equation}
+Here $h(x)$ concatenates all intermediate responses needed by the $M$
+objectives.  Components may be objective-specific, duplicated, or shared by
+several objectives; the benchmark definitions state which case applies.  One
+joint expensive evaluation observes all entries of $h(x)$ without noise, and
+all final objectives are then computed by the deterministic, known, and
+inexpensive map $\composemap$.  Every objective is minimized.  These assumptions
+describe the controlled experiments in this paper; partial and noisy
+intermediate measurements are left for future work.
+
+\paragraph{Equal-score/different-sensitivity criterion.}
+The computation graph satisfies our criterion when there are two attainable
+intermediate states $u,v\in h(\mathcal X)$ such that
+\[
+u\ne v,\qquad \composemap(u)=\composemap(v),\qquad
+J_{\composemap}(u)\ne J_{\composemap}(v),
+\]
+where $J_{\composemap}$ is the Jacobian of the known objective map.  In
+numerical problems, equality may be interpreted within a fixed tolerance.  For
+a nonsmooth map such as a maximum, the corresponding requirement is that the
+active component or subgradient differs.  In plain terms, the same objective
+value conceals different local responses to a component change.  This is
+stronger than requiring the map to be merely many-to-one: an additive sum is
+many-to-one but has constant sensitivity, so it does not satisfy the strong
+criterion.  Observing $h$ and knowing $\composemap$ exactly are also required;
+otherwise the composite model cannot use the distinction.
+
+A design $x$ is Pareto dominated by $x'$ if
+$f_m(x')\le f_m(x)$ for every $m$ and the inequality is strict for at least one
+objective.  The Pareto set $\mathcal P_X$ contains designs that are not
+dominated by any point in $\mathcal X$, and the Pareto front is
+$\mathcal P_F=\{f(x):x\in\mathcal P_X\}$.  Given a minimization reference point
+$r$, the quality of an observed nondominated set $P_n$ is its dominated
+hypervolume
+\begin{equation}
+  \HV(P_n;r)=\lambda_M\!\left(
+  \bigcup_{y\in P_n}[y_1,r_1]\times\cdots\times[y_M,r_M]
+  \right),
+  \label{eq:hv}
+\end{equation}
+where $\lambda_M$ is $M$-dimensional Lebesgue measure.  Hypervolume is the sole
+performance metric used to rank the methods.
+
+Every expensive evaluation reveals either $f(x)$ alone to a direct solver, or
+$h(x)$ to a composite solver; in the latter case $f(x)$ is computed without a
+second oracle call.  For a direct model we fit independent GPs
+$\widehat f_1,\ldots,\widehat f_M$.  For a composite model we fit independent
+GPs $\widehat h_1,\ldots,\widehat h_K$.  If
+$H^{(s)}(x)\sim p(h(x)\mid\mathcal D_n)$ is a joint posterior draw, then
+\begin{equation}
+  F^{(s)}(x)=\composemap\!\left(H^{(s)}(x)\right)
+  \label{eq:posterior-pushforward}
+\end{equation}
+is used inside the same acquisition function as the direct posterior draw.
+Thus the expensive-evaluation interface, objective definition, and acquisition
+criterion are unchanged; only the surrogate representation differs.  Our
+independent component GPs do not exploit correlations among entries of $h$, so
+the comparison tests a deliberately simple and broadly reusable form of
+composition.
+
+\section{Considered methods}
+\label{sec:methods}
+
+We evaluate four method families: qLogEHVI, smooth Tchebycheff (STCH),
+spherical-linear STCH, and MORBO.  Every family has a matched pair that differs
+only in its modeled response.  We use the names Direct--$X$ for the
+objective-space version and Composite--$X$ for its composite counterpart.
+Complete model and optimization settings appear in
+Appendix~\ref{app:implementation}.
+
+\subsection{qLogEHVI}
+The direct method fits standardized independent GPs to $-f_m$ and chooses one
+point at a time with qLogEHVI.  The composite method fits the same GP class to
+$h_k$ and applies $-\composemap$ to posterior samples inside qLogEHVI.  Both use
+the same observed Pareto partition and minimization reference point after the
+sign conversion.
+
+\subsection{Smooth Tchebycheff scalarization}
+For an ideal point $z^\star$, positive preference vector $w$, and temperature
+$\tau$, we minimize
+\begin{equation}
+  s_w(y)=\tau\log\sum_{m=1}^{M}
+  \exp\!\left(\frac{w_m(y_m-z_m^\star)}{\tau}\right).
+  \label{eq:stch}
+\end{equation}
+The direct method applies $-s_w$ to objective-posterior draws and uses
+qLogExpectedImprovement.  The composite method applies
+$-s_w\!\circ\composemap$ to component-posterior draws.  Five fixed weights
+cover the two-objective simplex.  Each weight starts from the same initial
+design, branches independently, and its new designs are charged to one common
+evaluation budget.
+
+\subsection{Spherical-linear STCH}
+In high dimension we replace the usual stationary kernel with the
+spherical-linear construction of Doumont et al. \cite{doumont2026linear}.
+After centering and learned coordinate-wise scaling, $u\in\R^d$ is mapped to
+the unit sphere by the inverse stereographic projection
+\begin{equation}
+  P(u)=\frac{(2u,\,\lVert u\rVert^2-1)}{1+\lVert u\rVert^2},
+  \qquad
+  k(u,u')=b_0+b_1P(u)^\top P(u'),
+  \label{eq:spherical}
+\end{equation}
+with $(b_0,b_1)$ constrained to the simplex.  Direct and composite variants
+then use the STCH procedure above.  This finite-feature model is intentionally
+low capacity; composition asks it to learn smooth latent coordinates instead
+of a highly nonlinear aggregate.
+
+\subsection{MORBO}
+MORBO maintains several local trust regions and coordinates their candidates
+to improve the global Pareto set \cite{daulton2022morbo}.  We use the vendored
+batched engine with five regions and joint batches of five.  The direct version
+fits local GPs to the objectives.  The composite version fits the same local GP
+class to intermediate components and composes Thompson posterior samples
+before the engine's hypervolume-improvement scoring.  This is an adaptation of
+MORBO's surrogate/output interface, not an untouched default implementation;
+full settings are given in Appendix~\ref{app:implementation}.
+
+\section{Numerical experiments}
+\label{sec:experiments}
+
+The experiments cover synthetic and scientific problems in low- and
+high-dimensional design spaces.  Dominated hypervolume is the primary metric.
+Every Composite--$X$ method is compared with its matched Direct--$X$ method
+under the same expensive-evaluation budget and paired initial design.
+
+\subsection{Test problems}
+
+\paragraph{Benchmark inclusion criterion.}
+We choose problems by the equal-score/different-sensitivity property defined in
+Section~\ref{sec:problem}, not by their observed optimization result.  The same
+expensive evaluation must also reveal $h$, and $\composemap$ must be known and
+cheap.  Norms meet the criterion because equal lengths can have different
+directions; products because equal products can have different factor
+sensitivities; oscillatory maps because repeated values can occur at points
+with different slopes; and maxima because the same maximum can be controlled
+by different components.  Color formulation, DTLZ2, Langermann--Ackley, and
+shallow lake are strong instances.  The truss is a planned boundary case: its
+outer map is additive, so its sensitivity is constant.  This
+gives a direct hypothesis: MOBOCF should help most on the four strong instances
+and less on the additive boundary case, provided the intermediate components
+can be learned within the budget.
+
+Table~\ref{tab:benchmarks} summarizes the five two-objective minimization
+problems.  The three low-dimensional cases compare qLogEHVI and STCH; the two
+high-dimensional cases compare spherical-linear STCH and MORBO.  Color
+formulation, truss design, and shallow-lake management are deterministic
+scientific simulators; they are not tabular measured datasets.  DTLZ2 and
+Langermann--Ackley are controlled synthetic compositions.  Detailed equations
+and all modeled quantities appear in Appendix~\ref{app:benchmarks}.
+
+\begin{table}[t]
+\centering
+\caption{Benchmark graphs and budgets.  $K$ is the number of independently
+modeled intermediate outputs; all problems have $M=2$ minimized objectives.}
+\label{tab:benchmarks}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{lcccll}
+\toprule
+Benchmark & Type & $d$ & $K$ & Initial/total & Compared families \\
+\midrule
+Color formulation & scientific & 6 & 6 & 5/45 & qLogEHVI, STCH \\
+DTLZ2 & synthetic & 6 & 4 & 5/45 & qLogEHVI, STCH \\
+Four-bar truss (RE21) & scientific & 4 & 8 & 5/45 & qLogEHVI, STCH \\
+Langermann--Ackley & synthetic & 600 & 12 & 20/120 & spherical STCH, MORBO \\
+Shallow lake & scientific & 100 & 21 & 20/120 & spherical STCH, MORBO \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Synthetic problems}
+
+\paragraph{DTLZ2.}
+The six-dimensional DTLZ2 problem is the controlled low-dimensional synthetic
+case \cite{deb2002scalable}.  Five variables determine a nonnegative distance
+$g(x)$ from the Pareto set, while the remaining variable determines a
+trigonometric position on the front.  The final objectives multiply $1+g(x)$
+by cosine and sine position factors.  We expose four intermediates---separate
+copies of $g$ and the two trigonometric factors---so the composite surrogates
+learn distance and position before the known products are applied.  This
+factorization cleanly isolates the proposed mechanism because the exact Pareto
+front is known, yet direct objective models must learn the product geometry.
+
+\paragraph{Latent Langermann--Ackley.}
+This controlled high-dimensional problem maps 600 design coordinates through
+six fixed dense orthonormal projections.  One objective applies an oscillatory
+Langermann-style landscape to those latent coordinates, and the other applies
+the nested exponential and cosine operations of Ackley.  Objective-specific
+copies give $K=12$ independently modeled intermediates, deliberately avoiding
+implicit information sharing.  Its nominal dimension is 600 but its effective
+dimension is six, allowing us to ask whether component observations expose a
+learnable low-dimensional response that is hidden by two highly nonlinear
+outer maps.
+
+\subsubsection{Scientific problems}
+
+\paragraph{Multi-illuminant color formulation.}
+This six-variable scientific benchmark represents the concentrations of six
+hypothetical dyes in an opaque coating.  The simulator first converts the dye
+mixture into a 31-wavelength reflectance spectrum with the Kubelka--Munk model,
+then converts that spectrum into CIE Lab coordinates under a daylight
+approximation and Illuminant A.  These six illuminant-specific coordinates are
+the observed intermediate response.  The two minimized objectives are a
+daylight color-error norm and a metameric-mismatch norm measuring how the
+sample's error changes between illuminants.  A direct model therefore sees
+only two scalar distances, whereas the composite model retains the direction
+of the color error and the illumination under which it occurs.  This is
+representative of materials workflows in which spectroscopy or
+characterization produces a structured response before a small collection of
+application scores is computed \cite{chaoucha2022color,kubelka1931optik}.
+
+\paragraph{Four-bar truss.}
+The four design variables in RE21 are structural member cross-sectional areas
+subject to allowable-stress bounds \cite{tanabe2020realworld}.  Eight
+intermediates are the four member-volume contributions and four signed
+compliance contributions.  Their known outer map sums and normalizes these
+terms into total material volume and loaded-joint displacement.  Unlike the
+other reductions, this map is essentially additive and monotone.  The problem
+therefore serves as a scientific boundary case: its component values are
+physically interpretable, but the final objectives themselves remain smooth
+and do not strongly discard component geometry.
+
+\paragraph{Shallow-lake management.}
+The 100 design variables specify annual phosphorus-release policies in a
+century-long dynamical simulation \cite{carpenter1999lake,ward2015tipping}.
+Across 100 fixed inflow scenarios, the simulator returns 20 normalized
+five-year phosphorus peaks and one normalized discounted-utility value.  The
+objectives minimize the worst block peak and one minus utility.  Taking a
+maximum creates a nonsmooth envelope whenever the controlling time block
+changes and erases which part of the trajectory caused the objective.  The
+composite model instead observes the time-resolved block summaries before
+applying this maximum, mirroring scientific control problems in which an
+entire trajectory is available even though optimization is scored by a worst
+event and an aggregate benefit.
+
+\subsection{Evaluation metric and experimental settings}
+
+We run 10 independent paired trials with seeds
+$0,10007,\ldots,90063$.  A scrambled Sobol design supplies 5 initial points in
+the low-dimensional suite and 20 in the high-dimensional suite.  The budgets
+are 45 and 120 total expensive design evaluations, respectively; hence the
+adaptive phases contain 40 and 100 evaluations.  For each method family, the
+direct and composite variants have bit-identical initial designs.  Initial
+designs need not match across different families.
+
+For STCH the five weights are
+$(0.05,0.95)$, $(0.275,0.725)$, $(0.5,0.5)$,
+$(0.725,0.275)$, and $(0.95,0.05)$, with $\tau=0.05$.  Each low-dimensional
+branch receives 8 adaptive evaluations; each high-dimensional branch receives
+20.  The plotted trace interleaves branches in round-robin weight order after
+the shared initial design.  MORBO performs 20 joint batches of size 5 after its
+20 initial points.  Low-dimensional acquisition optimization uses 128 raw
+samples and 8 restarts; high-dimensional STCH uses 256 and 10.  All acquisition
+optimizers use at most 200 iterations.
+
+We report dominated hypervolume, not hypervolume regret.  Objectives are scaled
+to a nominal $[0,1]$ range.  The reference point is $(1.1,1.1)$ for DTLZ2 and
+Langermann--Ackley and $(1.05,1.05)$ otherwise.  No known Pareto front is used
+to compute the metric; the analytic DTLZ2 ceiling is shown only for
+interpretation.  Because reference points and objective meanings differ,
+absolute hypervolumes are compared only within a benchmark.  We report the
+mean final hypervolume and its standard error over trials, the number of paired
+trials in which composite is larger, and the relative change
+$(\overline{\HV}_{\cf}-\overline{\HV}_{\direct})/
+\overline{\HV}_{\direct}$.  We also average the hypervolume over every
+post-initial evaluation to obtain a time-averaged learning-curve summary.
+
+\section{Results and discussion}
+\label{sec:results}
+
+Composite modeling increases mean final hypervolume in every comparison in
+Table~\ref{tab:results}; Figures~\ref{fig:low-learning-curves}
+and~\ref{fig:high-learning-curves} show the complete learning curves.  It wins
+89 of 100 individual paired trials.  Across
+the ten comparisons, the median relative final gain is 6.98\%, and the median
+post-initial time-averaged gain is 4.98\%.  The scale of benefit is strongly
+problem- and method-dependent: the largest gain is 69.91\% for STCH on DTLZ2,
+whereas the additive four-bar graph yields less than 1\% at the final budget.
+
+\begin{table}[t]
+\centering
+\caption{Final dominated hypervolume over 10 paired trials (mean $\pm$ standard
+error).  Gain is computed from the displayed methods' unrounded means.}
+\label{tab:results}
+\footnotesize
+\setlength{\tabcolsep}{3.8pt}
+\begin{tabular}{llrrr}
+\toprule
+Benchmark & Method family & Direct & Composite & Gain \\
+\midrule
+Color formulation & qLogEHVI
+  & $0.8502\!\pm\!0.0110$ & $0.9672\!\pm\!0.0027$ & $+13.76\%$ \\
+ & STCH
+  & $0.8045\!\pm\!0.0124$ & $0.8747\!\pm\!0.0119$ & $+8.73\%$ \\
+DTLZ2 & qLogEHVI
+  & $0.2928\!\pm\!0.0311$ & $0.4053\!\pm\!0.0008$ & $+38.43\%$ \\
+ & STCH
+  & $0.0839\!\pm\!0.0185$ & $0.1425\!\pm\!0.0193$ & $+69.91\%$ \\
+Four-bar truss & qLogEHVI
+  & $0.8503\!\pm\!0.0006$ & $0.8573\!\pm\!0.0001$ & $+0.82\%$ \\
+ & STCH
+  & $0.8095\!\pm\!0.0030$ & $0.8151\!\pm\!0.0014$ & $+0.69\%$ \\
+\midrule
+Langermann--Ackley & spherical STCH
+  & $0.6650\!\pm\!0.0098$ & $0.6888\!\pm\!0.0072$ & $+3.59\%$ \\
+ & MORBO
+  & $0.6368\!\pm\!0.0139$ & $0.6705\!\pm\!0.0154$ & $+5.29\%$ \\
+Shallow lake & spherical STCH
+  & $0.1071\!\pm\!0.0009$ & $0.1164\!\pm\!0.0008$ & $+8.66\%$ \\
+ & MORBO
+  & $0.0954\!\pm\!0.0010$ & $0.0993\!\pm\!0.0013$ & $+4.08\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Low-dimensional problems}
+
+\begin{figure}[!ht]
+\centering
+\begin{minipage}[t]{0.49\linewidth}
+  \centering
+  \resultplot[width=\linewidth]{color_formulation_graph.png}
+  \par\vspace{0.4em}
+  {\small (a) Color formulation\par}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.49\linewidth}
+  \centering
+  \resultplot[width=\linewidth]{dtlz2_graph.png}
+  \par\vspace{0.4em}
+  {\small (b) DTLZ2\par}
+\end{minipage}\par\vspace{1.25em}
+\begin{minipage}[t]{0.58\linewidth}
+  \centering
+  \resultplot[width=\linewidth]{four_bar_truss_graph.png}
+  \par\vspace{0.4em}
+  {\small (c) Four-bar truss RE21\par}
+\end{minipage}
+\caption{Low-dimensional dominated-hypervolume learning curves.  Lines are
+means and bands are one standard error over 10 trials; the vertical line ends
+the 5-point initial design.  Each method uses 45 total evaluations.}
+\label{fig:low-learning-curves}
+\end{figure}
+
+DTLZ2 provides the clearest low-dimensional instance of the inclusion
+criterion.  Its direct objectives
+multiply a distance term by trigonometric position terms; the composite model
+instead observes those smooth factors.  With reference point $(1.1,1.1)$, the
+exact attainable hypervolume is
+$1.1^2-\pi/4=0.42460$.  Composite qLogEHVI reaches 0.40535 on average
+(95.46\% of the ceiling), compared with 0.29281 (68.96\%) for direct qLogEHVI.
+Color formulation also exhibits a substantial advantage.  Its two scores are
+norms of six illuminant-specific Lab coordinates, so the outer reductions erase
+both direction and illuminant-specific error; preserving those coordinates
+raises final hypervolume by 13.76\% under qLogEHVI and 8.73\% under STCH.
+
+The four-bar truss has the same formal composite graph but a nearly additive,
+monotone reduction.  Its direct objectives are already smooth and easy to fit,
+so final gains are only 0.82\% and 0.69\%.  Composition improves early search
+more clearly: its post-initial time-averaged gains are 2.91\% for qLogEHVI and
+5.16\% for STCH.  This contrast supports a more specific hypothesis than
+``more outputs are better'': composition is most useful when the known outer
+same final value can correspond to factor states with different sensitivities.
+Thus the composite advantage appears both during the adaptive phase and at the
+final budget, and it occurs under both hypervolume and scalarization search.
+
+\subsection{High-dimensional problems}
+
+\begin{figure}[!ht]
+\centering
+\begin{minipage}[t]{0.49\linewidth}
+  \centering
+  \resultplot[width=\linewidth]{langermann_ackley_graph.png}
+  \par\vspace{0.4em}
+  {\small (a) Langermann--Ackley\par}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.49\linewidth}
+  \centering
+  \resultplot[width=\linewidth]{shallow_lake_graph.png}
+  \par\vspace{0.4em}
+  {\small (b) Shallow lake\par}
+\end{minipage}
+\caption{High-dimensional dominated-hypervolume learning curves.  Lines are
+means and bands are one standard error over 10 trials; the vertical line ends
+the 20-point initial design.  Each method uses 120 total evaluations.}
+\label{fig:high-learning-curves}
+\end{figure}
+
+In 600 dimensions, Langermann--Ackley depends on six dense orthonormal
+projections.  Direct surrogates must represent an oscillatory Langermann map
+and the nested exponential Ackley map over the ambient box.  Composite
+spherical-linear GPs see the projections themselves, increasing final
+hypervolume by 3.59\%; component-level local GPs raise MORBO by 5.29\%.
+The gains are meaningful but smaller than DTLZ2 because the twelve independent
+component GPs duplicate the same six latent coordinates and do not share
+information across objectives.
+
+The shallow-lake outer objective takes a maximum over 20 time blocks.  The
+identity of the controlling block changes with the release policy, creating a
+nonsmooth envelope and discarding temporal location.  Modeling block peaks
+before the maximum improves spherical STCH by 8.66\% and MORBO by 4.08\%.
+This is the clearest scientific high-dimensional example of equal score but
+different sensitivity: the same worst value can be controlled by a different
+part of the trajectory.
+
+All four high-dimensional method--benchmark pairs improve at the final budget,
+with a median relative gain of 4.69\%.  Their post-initial time-averaged gains
+range from 2.59\% to 6.67\%, so the benefit also appears before the final
+evaluation.  These results do not show that input dimension alone increases
+the value of composition.  Instead, spherical-linear modeling and MORBO handle
+the large design space, while the composite representation determines whether
+their models retain useful response information.
+
+\subsection{When does composite modeling help?}
+\label{sec:discussion}
+
+The results follow the equal-score/different-sensitivity criterion.  The color
+norms assign the same distance to errors pointing in different directions;
+the DTLZ2 products can match while their factors have different derivatives;
+the Langermann--Ackley maps repeat values with different slopes; and the
+shallow-lake maximum can switch its controlling time block.  In each case, the
+composite model distinguishes states that an objective-only model merges.  The
+number of components must still be small or structured enough to model within
+the available budget.  This explains why the gains vary: DTLZ2 and color are
+strong instances, while the additive truss has constant outer sensitivity and
+yields less than one percent at the final budget.  More outputs
+alone are not the point; equal-score states must imply meaningfully different
+local behavior.
+
+This interpretation is consistent across, but not identical for, the four
+optimization regimes.  Direct and composite variants use the same acquisition
+principle, initialization, and expensive-evaluation budget within each pair,
+so the paired difference isolates which response is modeled.  Improvements
+under qLogEHVI, conventional STCH, spherical STCH, and MORBO indicate that the
+effect is not confined to one scalarization or one global optimizer.  At the
+same time, the gains differ between method families on the same problem.  The
+representation and the acquisition geometry therefore interact: a more
+informative posterior can help several acquisition rules, but each rule uses
+that posterior differently.  Establishing causal contributions from
+particular map properties would require a dedicated ablation that varies one
+property at a time, so we treat the product, norm, oscillation, and maximum
+explanations as mechanisms supported by the controlled contrasts rather than
+as separately identified effects.
+
+\paragraph{Implications for scientific design.}
+The practical opportunity is largest when an experiment or simulator already
+returns a rich characterization and the reported objectives are deterministic
+summaries of it.  A spectrometer returns a curve before software computes a
+color error; a dynamical model returns a trajectory before a worst-time score;
+and a mechanics calculation returns member-level quantities before total
+volume or displacement.  Discarding these responses forces a direct GP to
+reconstruct the geometry of the summary from one or two numbers per design.
+Composite MOBO keeps the same number of synthesized samples or simulator calls
+while retaining the response that those calls already produced.  This makes
+the approach especially relevant to the AI-guided-design part of a
+self-driving laboratory: it changes the statistical interface between
+characterization and decision-making without requiring a new instrument or an
+additional physical experiment
+\cite{macleod2022selfdriving,gopakumar2018multiobjective}.
+
+The results also suggest a practical screening rule.  Composite modeling is a
+strong candidate when the intermediate response is observable at negligible
+additional experimental cost, its transformation into objectives is known and
+stable, and that transformation contains a norm, extremum, product, threshold,
+or another reduction that loses identifiable structure.  A direct model may
+be preferable when the final objectives are already smooth and low-complexity,
+when the component vector is extremely large relative to the budget, or when
+the supposed components are noisy and only weakly related to Pareto
+improvement.  The four-bar result illustrates the first case, while the
+duplicated Langermann coordinates and 21-output lake model illustrate the
+statistical and computational price of the second.  In practice, a short
+paired pilot can compare posterior calibration and early hypervolume progress
+before committing the full experimental campaign.
+
+\paragraph{Sample efficiency and computational cost.}
+Composition adds no physical evaluations in these comparisons, but it does not
+make optimization free.  The median post-initial hypervolume gain of 4.98\%
+shows that the advantage is present across the trajectory rather than only at
+the final design.  Against this, composite runs take a median 3.45 times as
+long, with the largest overhead for the 21-output shallow-lake spherical
+model.  Whether that exchange is favorable depends on the scientific cost
+model.  Several extra hours of surrogate fitting may be negligible when a
+synthesis-and-characterization cycle takes a day and consumes scarce material;
+the same overhead may be unacceptable for a cheap analytic simulator.  Better
+multi-output kernels, shared latent models, and selective component modeling
+could reduce this cost because the present implementation fits independent GPs
+even when components are correlated or duplicated.
+
+\subsection{Limitations and next steps}
+The suite is intentionally scoped to the equal-score/different-sensitivity
+criterion above.  It therefore does not establish universal or average
+superiority over arbitrary black-box objectives; it evaluates MOBOCF where
+there is a clear reason for preserving the intermediate response.  The
+reported oracles are deterministic simulators rather than new physical
+experiments, and the color and shallow-lake cases are simplified slices of
+richer scientific domains.  The high-dimensional benchmarks also have
+exploitable structure: Langermann--Ackley has six-dimensional effective
+variation, while the lake objective is organized by time.  Hyperparameters and
+acquisition settings are matched but not exhaustively tuned, runtime
+measurements are cluster wall times rather than hardware-normalized complexity
+experiments, and every problem has two objectives and a box domain.  The study
+does not yet address measurement noise, unknown or uncertain outer maps,
+missing intermediate observations, feasibility constraints, mixture-simplex
+domains, or more than two target properties.
+
+A broader study should compare direct, independent-component, and correlated
+multi-output surrogates across a wider range of transformations, including
+maps that preserve most intermediate information.  It should also allow the optimizer to choose
+adaptively between direct and composite representations as evidence
+accumulates, and should test partial or noisy component observations and
+learned outer maps.  Most importantly, a prospective wet-lab campaign should
+measure whether the hypervolume benefit survives calibration drift and
+experimental variability.  Hyperspectral nanoparticle synthesis
+\cite{low2024constrained} and composition or process optimization in which
+spectroscopy is already part of the automated loop are natural candidates:
+they directly test whether retaining characterization outputs accelerates the
+discovery of Pareto-improving materials.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This application study asked whether established multi-objective Bayesian
+optimization methods should model only the final scientific objectives or
+preserve observable intermediate responses and apply the known objective map
+afterward.  Across four strong instances of the
+equal-score/different-sensitivity criterion, one additive boundary case, and
+four MOBO regimes, the composite
+variant improved all ten mean final hypervolumes under matched expensive
+evaluation budgets.  The median relative final gain was 6.98\%, and the median
+post-initial time-averaged gain was 4.98\%.  The result spans low-dimensional
+global qLogEHVI and STCH, high-dimensional spherical STCH, and a batched MORBO
+wrapper, showing that the established BOCF representation can benefit both
+hypervolume- and scalarization-based scientific search.
+
+The comparison also identifies the scope of that conclusion.  The largest
+benefits arise when equal objective values correspond to different local
+sensitivities: equal norms can point in different directions, equal products
+can have different factors, repeated oscillatory values can have different
+slopes, and equal maxima can be controlled by different time blocks.  A
+physically meaningful decomposition is not automatically useful; when the
+outer map has constant sensitivity, as in the four-bar truss, direct objective
+models can already capture most of the relevant geometry.  Composition should
+therefore be chosen from this criterion and the available budget, not treated
+as a default replacement for direct MOBO.
+
+For automated scientific and materials design, the central implication is
+simple: characterization data should not be collapsed prematurely when the
+full response is already available.  Composite MOBO can extract more learning
+signal from each physical evaluation without asking the laboratory to perform
+more experiments, although the additional surrogate fitting must be justified
+by the cost of those experiments.  The next step is to move beyond
+deterministic two-objective simulators toward correlated multi-output models,
+partial and noisy responses, uncertain objective maps, adaptive selection
+between direct and composite surrogates, and prospective validation in an
+automated materials campaign.  Under those conditions, composition is best
+viewed not as a new experimental instrument, but as a way to stop discarding
+information produced by instruments and simulators already inside the
+self-driving laboratory.
+
+\clearpage
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{ament2023unexpected}
+S.~Ament, S.~Daulton, D.~Eriksson, M.~Balandat, and E.~Bakshy.
+Unexpected improvements to expected improvement for Bayesian optimization.
+In \emph{Advances in Neural Information Processing Systems}, 36, 2023.
+
+\bibitem{astudillo2019bayesian}
+R.~Astudillo and P.~I. Frazier.
+Bayesian optimization of composite functions.
+In \emph{Proceedings of the 36th International Conference on Machine Learning},
+PMLR 97:354--363, 2019.
+
+\bibitem{astudillo2021networks}
+R.~Astudillo and P.~I. Frazier.
+Bayesian optimization of function networks.
+In \emph{Advances in Neural Information Processing Systems}, 34, 2021.
+
+\bibitem{balandat2020botorch}
+M.~Balandat, B.~Karrer, D.~R. Jiang, S.~Daulton, B.~Letham, A.~G. Wilson, and E.~Bakshy.
+BoTorch: A framework for efficient Monte-Carlo Bayesian optimization.
+In \emph{Advances in Neural Information Processing Systems}, 33, 2020.
+
+\bibitem{carpenter1999lake}
+S.~R. Carpenter, D.~Ludwig, and W.~A. Brock.
+Management of eutrophication for lakes subject to potentially irreversible change.
+\emph{Ecological Applications}, 9(3):751--771, 1999.
+doi:10.1890/1051-0761(1999)009[0751:MOEFLS]2.0.CO;2.
+
+\bibitem{chaoucha2022color}
+S.~Chaoucha, A.~Moussa, and N.~Ladhari.
+Color formulation of cotton fabrics using multi-objective ant colony optimization.
+\emph{Journal of Natural Fibers}, 19(17):15459--15474, 2022.
+doi:10.1080/15440478.2022.2128145.
+
+\bibitem{coelho2025composite}
+R.~P. Cardoso Coelho, A.~F. Carvalho Alves, T.~M. Nogueira Pires, and
+F.~M. Andrade Pires.
+A composite Bayesian optimisation framework for material and structural design.
+\emph{Computer Methods in Applied Mechanics and Engineering}, 434:117516, 2025.
+doi:10.1016/j.cma.2024.117516.
+
+\bibitem{daulton2020differentiable}
+S.~Daulton, M.~Balandat, and E.~Bakshy.
+Differentiable expected hypervolume improvement for parallel multi-objective
+Bayesian optimization.
+In \emph{Advances in Neural Information Processing Systems}, 33, 2020.
+
+\bibitem{daulton2022morbo}
+S.~Daulton, D.~Eriksson, M.~Balandat, and E.~Bakshy.
+Multi-objective Bayesian optimization over high-dimensional search spaces.
+In \emph{Proceedings of the 38th Conference on Uncertainty in Artificial
+Intelligence}, PMLR 180:507--517, 2022.
+
+\bibitem{deb2002scalable}
+K.~Deb, L.~Thiele, M.~Laumanns, and E.~Zitzler.
+Scalable multi-objective optimization test problems.
+In \emph{Proceedings of the 2002 Congress on Evolutionary Computation},
+pages 825--830, 2002.
+
+\bibitem{doumont2026linear}
+C.~Doumont, D.~Fan, N.~Maus, J.~R. Gardner, H.~Moss, and G.~Pleiss.
+We still don't understand high-dimensional Bayesian optimization.
+In \emph{Proceedings of the 29th International Conference on Artificial
+Intelligence and Statistics}, 2026.
+
+\bibitem{frazier2018tutorial}
+P.~I. Frazier.
+A tutorial on Bayesian optimization.
+\emph{arXiv:1807.02811}, 2018.
+
+\bibitem{gopakumar2018multiobjective}
+A.~M. Gopakumar, P.~V. Balachandran, D.~Xue, J.~E. Gubernatis, and T.~Lookman.
+Multi-objective optimization for materials discovery via adaptive design.
+\emph{Scientific Reports}, 8:3738, 2018.
+doi:10.1038/s41598-018-21936-3.
+
+\bibitem{knowles2006parego}
+J.~Knowles.
+ParEGO: A hybrid algorithm with on-line landscape approximation for expensive
+multiobjective optimization problems.
+\emph{IEEE Transactions on Evolutionary Computation}, 10(1):50--66, 2006.
+
+\bibitem{kubelka1931optik}
+P.~Kubelka and F.~Munk.
+Ein Beitrag zur Optik der Farbanstriche.
+\emph{Zeitschrift f\"ur Technische Physik}, 12:593--601, 1931.
+
+\bibitem{lin2024smooth}
+X.~Lin, Z.~Yang, X.~Zhang, and Q.~Zhang.
+Smooth Tchebycheff scalarization for multi-objective optimization.
+In \emph{Proceedings of the 41st International Conference on Machine Learning},
+2024.
+
+\bibitem{lookman2019active}
+T.~Lookman, P.~V. Balachandran, D.~Xue, and R.~Yuan.
+Active learning in materials science with emphasis on adaptive sampling using
+uncertainties for targeted design.
+\emph{npj Computational Materials}, 5:21, 2019.
+doi:10.1038/s41524-019-0153-8.
+
+\bibitem{low2024constrained}
+A.~K. Low et al.
+Evolution-guided Bayesian optimization for constrained multi-objective
+optimization in self-driving labs.
+\emph{npj Computational Materials}, 10:104, 2024.
+doi:10.1038/s41524-024-01274-x.
+
+\bibitem{macleod2022selfdriving}
+B.~P. MacLeod et al.
+A self-driving laboratory advances the Pareto front for material properties.
+\emph{Nature Communications}, 13:995, 2022.
+doi:10.1038/s41467-022-28580-6.
+
+\bibitem{maddox2021outputs}
+W.~J. Maddox, M.~Balandat, A.~G. Wilson, and E.~Bakshy.
+Bayesian optimization with high-dimensional outputs.
+In \emph{Advances in Neural Information Processing Systems}, 34, 2021.
+
+\bibitem{maddox2021physics}
+W.~J. Maddox, Q.~Feng, and M.~Balandat.
+Optimizing high-dimensional physics simulations via composite Bayesian optimization.
+In \emph{Fourth Workshop on Machine Learning and the Physical Sciences}, 2021.
+arXiv:2111.14911.
+
+\bibitem{pires2026composite}
+T.~M. Nogueira Pires, R.~P. Cardoso Coelho, and F.~M. Andrade Pires.
+Composite Bayesian optimisation for multi-objective problems with smooth
+Tchebycheff scalarisation.
+\emph{Structural and Multidisciplinary Optimization}, 69:34, 2026.
+doi:10.1007/s00158-025-04229-y.
+
+\bibitem{shahriari2016taking}
+B.~Shahriari, K.~Swersky, Z.~Wang, R.~P. Adams, and N.~de~Freitas.
+Taking the human out of the loop: A review of Bayesian optimization.
+\emph{Proceedings of the IEEE}, 104(1):148--175, 2016.
+
+\bibitem{stach2021autonomous}
+E.~Stach et al.
+Autonomous experimentation systems for materials development: A community perspective.
+\emph{Matter}, 4(9):2702--2726, 2021.
+doi:10.1016/j.matt.2021.06.036.
+
+\bibitem{tanabe2020realworld}
+R.~Tanabe and H.~Ishibuchi.
+An easy-to-use real-world multi-objective optimization problem suite.
+\emph{Applied Soft Computing}, 89:106078, 2020.
+doi:10.1016/j.asoc.2020.106078.
+
+\bibitem{wang2025constrained}
+F.~Wang, M.~Parhizkar, A.~Harker, and M.~Edirisinghe.
+Constrained composite Bayesian optimization for rational synthesis of polymeric particles.
+\emph{Digital Discovery}, 4:3066--3077, 2025.
+doi:10.1039/D5DD00243E.
+
+\bibitem{ward2015tipping}
+V.~L. Ward, R.~Singh, P.~M. Reed, and K.~Keller.
+Confronting tipping points: Can multi-objective evolutionary algorithms discover
+pollution control tradeoffs given environmental thresholds?
+\emph{Environmental Modelling \& Software}, 73:27--43, 2015.
+doi:10.1016/j.envsoft.2015.07.020.
+
+\bibitem{wyman2013simple}
+C.~Wyman, P.-P. Sloan, and P.~Shirley.
+Simple analytic approximations to the CIE XYZ color matching functions.
+\emph{Journal of Computer Graphics Techniques}, 2(2):1--11, 2013.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Detailed method descriptions}
+\label{app:implementation}
+
+\subsection{Shared direct/composite mechanics}
+
+All calculations use double precision.  Inputs are normalized to $[0,1]^d$.
+Each scalar output has its own \texttt{SingleTaskGP} and standardization
+transform; collections are represented by a \texttt{ModelListGP}.  Unless
+specified otherwise, BoTorch's default single-task GP covariance and inferred
+Gaussian likelihood are used \cite{balandat2020botorch}.  Direct models have
+$M=2$ outputs; composite models have the benchmark-specific $K$ outputs in
+Table~\ref{tab:benchmarks}.  We deliberately do not use multi-task covariance,
+latent sharing, or a component bottleneck.
+
+At every proposed composite point, the oracle is called once for $h(x)$ and
+$f(x)$ is reconstructed as $\composemap(h(x))$.  The implementation checks the
+composition on domain validation and the archived results were re-evaluated
+against the current benchmark code: objective and component reconstructions
+agree to numerical precision (maximum discrepancies on the order of
+$10^{-13}$).  Evaluation caches are cleared between methods, and every returned
+history is asserted to contain exactly 45 or 120 designs.
+
+The qLogEHVI run is sequential ($q=1$).  Acquisition optimization uses box
+bounds, multistart gradient optimization, and a fresh Sobol fallback if a
+nonlinear composition produces non-finite gradients.  STCH branches share only
+their initial observations; after branching, the GP for each weight is updated
+using that weight's own new points.  The archive combines the five branches in
+round-robin order solely to define an order-neutral hypervolume trace.
+
+\subsection{Spherical-linear surrogate}
+
+For each output, the implementation centers $x$ at $(1/2,\ldots,1/2)$, divides
+coordinates by learned ARD scales, and applies a learned global radial scale
+before Eq.~\eqref{eq:spherical}.  A softmax constrains $b_0+b_1=1$ and
+$b_0,b_1>0$.  The GP has a constant mean, a learned Gaussian likelihood with a
+log-normal noise prior, and standardized outputs.  This is a finite
+$O(d)$-feature linear model; posterior inference is $O(nd^2)$ and therefore
+linear in the number of observations $n$ for fixed $d$, rather than an RBF GP
+claiming to resolve a 600-dimensional surface from 120 points.
+
+\subsection{MORBO wrapper}
+
+The high-dimensional runner calls \texttt{batched\_morbo} and
+\texttt{composite\_batched\_morbo}, which wrap the vendored coordinated engine
+under \texttt{morbo/}; it does not call the separate sequential prototype.
+There are five trust regions, each initialized with side length $0.8$, minimum
+$0.01$, and maximum $1.6$.  Candidate pools contain 512 raw points.  Each local
+output GP uses a Mat\'ern-$5/2$ ARD kernel with length scales constrained to
+$[0.05,4]$, output scale, and a Gaussian likelihood with a Gamma noise prior.
+The engine uses its lower-tail winsorization and coordinated Thompson/HVI
+selection.  Minimum local training size is 19 because the initial design has
+20 points.  The success streak is set to 10,000, effectively disabling region
+expansion within this budget; failure streaks are
+$\max(\lfloor d/3\rfloor,10)$, i.e., 200 for Langermann--Ackley and 33 for the
+lake.  Twenty joint batches of five bring each history from 20 to 120 designs.
+
+These details matter when interpreting ``MORBO'': this is a budget-adapted
+wrapper around the published engine, not a claim that all published default
+settings were preserved.  Direct and composite variants use identical engine
+settings, which is sufficient for the representation comparison made here.
+
+\section{Benchmark definitions}
+\label{app:benchmarks}
+
+This section specifies the exact deterministic oracle used in the experiments.
+All vectors $x$ below are normalized to $[0,1]^d$ and all final objectives are
+minimized.
+
+\subsection{Multi-illuminant color formulation: $d=6$, $K=6$}
+
+This analytical simulator represents six hypothetical dye loadings in an
+opaque textile coating.  It is motivated by multi-objective color formulation
+under multiple illuminants \cite{chaoucha2022color}, but is not a measured
+dataset and does not reproduce that paper's objective equations.  Wavelengths
+are $\lambda\in\{400,410,\ldots,700\}$ nm.  Define
+\begin{equation}
+ B(\lambda;\mu,\sigma)=
+ \exp\!\left[-\tfrac12\left(\frac{\lambda-\mu}{\sigma}\right)^2\right].
+\end{equation}
+The substrate absorption-to-scattering ratio is
+$q_0(\lambda)=0.012+0.008B(\lambda;430,75)$.  The six fixed dye increments are
+\begin{equation}
+\begin{aligned}
+q_1 &= 1.75B(610,34)+0.22B(445,52),\\
+q_2 &= 1.55B(535,31)+0.18B(650,42),\\
+q_3 &= 1.65B(448,28)+0.16B(585,65),\\
+q_4 &= 1.20B(495,48)+0.38B(632,27),\\
+q_5 &= 1.35B(575,41)+0.24B(420,24),\\
+q_6 &= 0.55+0.22B(510,115),
+\end{aligned}
+\end{equation}
+where wavelength arguments are suppressed.  Concentrations are
+$c_i=0.85x_i$ and $q=q_0+\sum_i c_iq_i$.  The opaque Kubelka--Munk inverse
+\cite{kubelka1931optik} gives reflectance
+\begin{equation}
+  R(\lambda)=1+q(\lambda)-\sqrt{q(\lambda)^2+2q(\lambda)}.
+  \label{eq:km}
+\end{equation}
+
+Analytic CIE 1931 matching curves from Wyman et al.
+\cite{wyman2013simple} convert $R$ to XYZ under blackbody spectra at 6504 K
+(daylight approximation, $D$) and 2856 K (Illuminant A).  With the illuminant's
+perfect-reflector white point, XYZ is converted to CIE Lab using
+\begin{equation}
+ L^*=116\phi(Y/Y_n)-16,\quad
+ a^*=500[\phi(X/X_n)-\phi(Y/Y_n)],\quad
+ b^*=200[\phi(Y/Y_n)-\phi(Z/Z_n)],
+\end{equation}
+where $\delta=6/29$ and
+$\phi(t)=t^{1/3}$ for $t>\delta^3$, otherwise
+$t/(3\delta^2)+4/29$.  The six intermediate outputs are
+\begin{equation}
+ h(x)=\big(L_D^*,a_D^*,b_D^*,L_A^*,a_A^*,b_A^*\big).
+\end{equation}
+
+The unattainable target pigment has
+\begin{equation}
+q_\star=q_0+0.92B(482,19)+0.74B(622,25)+0.18B(550,72),
+\end{equation}
+and is converted to target vectors $t_D,t_A$ by the same pipeline.  Let
+$e_D=h_{1:3}-t_D$ and $e_A=h_{4:6}-t_A$.  The objectives are
+\begin{equation}
+  f_1=\frac{\lVert e_D\rVert_2}{60},
+  \qquad
+  f_2=\frac{\lVert e_A-e_D\rVert_2}{18}.
+  \label{eq:color-objectives}
+\end{equation}
+Thus $f_1$ is daylight color error and $f_2$ is a metameric-mismatch proxy: it
+penalizes how the sample-minus-target Lab error changes between illuminants.
+The nonlinear norms erase the direction of the six-dimensional color errors.
+The hypervolume reference is $(1.05,1.05)$.
+
+\subsection{DTLZ2: $d=6$, $K=4$}
+
+The two-objective DTLZ2 problem \cite{deb2002scalable} is
+\begin{equation}
+ g(x)=\sum_{j=2}^{6}(x_j-0.5)^2,\qquad
+ \theta(x)=\frac{\pi x_1}{2},
+\end{equation}
+\begin{equation}
+ h(x)=\big(g,\cos\theta,g,\sin\theta\big),\qquad
+ f_1=(1+h_1)h_2,\quad f_2=(1+h_3)h_4.
+ \label{eq:dtlz}
+\end{equation}
+The repeated $g$ deliberately gives each objective an independently modeled
+component group, avoiding implicit multi-task transfer.  The Pareto set has
+$x_j=0.5$ for $j=2,\ldots,6$ and the front satisfies
+$f_1^2+f_2^2=1$, $f_1,f_2\ge0$.  For reference point $(1.1,1.1)$ the exact
+maximum hypervolume is $1.1^2-\pi/4$.
+
+\subsection{Four-bar truss RE21: $d=4$, $K=8$}
+
+This transparent structural-design problem follows the RE21 formulation in
+the real-world multi-objective suite \cite{tanabe2020realworld}.  The four
+cross-sectional areas are
+\begin{equation}
+ a=a^{\min}+x\odot(a^{\max}-a^{\min}),\quad
+ a^{\min}=(1,\sqrt2,\sqrt2,1),\quad a^{\max}=(3,3,3,3)
+\end{equation}
+in cm$^2$.  These bounds encode the allowable-stress restriction for load
+$F=10$ kN and allowable stress $10$ kN/cm$^2$.  Member length is $L=200$ cm
+and elastic modulus is $E=2\times10^5$ kN/cm$^2$.  The component vector is
+\begin{equation}
+h=\left(2a_1,\sqrt2a_2,\sqrt{a_3},a_4,
+        \frac2{a_1},\frac{2\sqrt2}{a_2},
+        -\frac{2\sqrt2}{a_3},\frac2{a_4}\right).
+\end{equation}
+Raw volume and loaded-joint displacement are
+\begin{equation}
+ V=L\sum_{k=1}^4h_k,
+ \qquad
+ D=\frac{FL}{E}\sum_{k=5}^8h_k.
+\end{equation}
+They are affinely normalized using exact extrema over the box:
+\begin{align}
+V_{\min}&=1237.8414,& V_{\max}&=2994.9383,\\
+D_{\min}&=0.00276142,& D_{\max}&=0.05057191,\\
+f_1&=(V-V_{\min})/(V_{\max}-V_{\min}),&
+f_2&=(D-D_{\min})/(D_{\max}-D_{\min}).
+\end{align}
+The reference is $(1.05,1.05)$.  Unlike the color and lake reductions, the
+outer map is essentially a signed sum plus affine scaling; this explains why
+the two objective GPs already capture most useful regularity.
+
+\subsection{Latent Langermann--Ackley: $d=600$, $K=12$}
+
+Let $A\in\R^{6\times600}$ have fixed orthonormal rows generated once with seed
+18,271, and define the dense latent vector
+\begin{equation}
+ z=8A(x-\tfrac12\mathbf1).
+\end{equation}
+The component response contains objective-specific copies,
+$h=(z,z)\in\R^{12}$.  This prevents the independent GP implementation from
+sharing the six latent observations across objectives.  For centers
+\begin{equation}
+C=\begin{bmatrix}
+1.6&-0.9&0.7&1.2&-1.4&0.5\\
+-1.3&1.5&-0.8&0.6&1.0&-1.1\\
+0.8&1.1&1.4&-1.5&-0.5&0.9\\
+-0.7&-1.6&1.0&1.4&0.8&-0.6\\
+1.2&0.6&-1.5&-0.9&1.3&1.0
+\end{bmatrix},\quad c=(1,2,5,2,3),
+\end{equation}
+let $r_i=\lVert z-C_i\rVert_2^2$ and $C_\Sigma=13$.  The two normalized
+objectives are
+\begin{align}
+f_1(z)&=\frac{C_\Sigma-
+ \sum_{i=1}^{5}c_i\exp(-r_i/\pi)\cos(\pi r_i)}{2C_\Sigma},
+ \label{eq:langermann}\\
+f_2(z)&=\frac{-20\exp[-0.2\sqrt{\frac16\sum_j z_j^2}]
+ -\exp[\frac16\sum_j\cos(2\pi z_j)]+20+e}{20+e-e^{-1}}.
+ \label{eq:ackley}
+\end{align}
+$f_1$ is a bounded Langermann-style landscape and $f_2$ is normalized Ackley.
+Their optima conflict: Ackley is minimized at $z=0$, whereas the Langermann
+centers are displaced.  The reference point is $(1.1,1.1)$.  Nominal dimension
+is high but effective dimension is six; the benchmark tests whether the
+surrogate can recover this dense projection under a strongly nonlinear outer
+map.
+
+\subsection{Shallow-lake management: $d=100$, $K=21$}
+
+Each $x_t$ controls annual anthropogenic phosphorus release
+$u_t=0.1x_t$ over 100 years.  The lake is simulated under 100 fixed
+common-random-number inflow scenarios.  For scenario $s$, $P_0^{(s)}=0$ and
+for $t=1,\ldots,99$,
+\begin{equation}
+P_t^{(s)}=0.58P_{t-1}^{(s)}+
+\frac{(P_{t-1}^{(s)})^2}{1+(P_{t-1}^{(s)})^2}
++u_{t-1}+\xi_{t-1}^{(s)},
+\label{eq:lake-dynamics}
+\end{equation}
+where
+$\xi_t^{(s)}\sim\operatorname{LogNormal}(-3.52,0.105^2)$ was drawn once with
+seed 20,240,820.  Fixing scenarios makes the oracle deterministic while
+retaining uncertainty in the expected physical response.  Let
+$\bar P_t=100^{-1}\sum_sP_t^{(s)}$.  The first 20 components are five-year
+block peaks,
+\begin{equation}
+h_b=\frac1{2.4}\max_{t=5(b-1),\ldots,5b-1}\bar P_t,
+\quad b=1,\ldots,20.
+\end{equation}
+The final component is normalized discounted utility,
+\begin{equation}
+h_{21}=\frac{0.4\sum_{t=0}^{99}0.98^tu_t}
+ {0.4(0.1)\sum_{t=0}^{99}0.98^t}.
+\end{equation}
+The minimized objectives and reference point are
+\begin{equation}
+ f_1=\max_{b=1,\ldots,20}h_b,\qquad
+ f_2=1-h_{21},\qquad r=(1.05,1.05).
+ \label{eq:lake-objectives}
+\end{equation}
+This is a deterministic two-objective slice of the shallow-lake dynamics of
+Carpenter et al.\ \cite{carpenter1999lake} as used in multi-objective robustness
+studies \cite{ward2015tipping}; it is not the original four-objective stochastic
+benchmark.  The last decision $u_{99}$ contributes to utility but, following
+the implemented indexing, not to the 100 recorded lake states.  The composite
+representation retains which five-year period controls water quality before
+the outer maximum discards that information.
+
+\section{Optimization configurations and runtime}
+\label{app:runtime}
+
+The implementation uses double-precision PyTorch tensors with BoTorch and
+GPyTorch models \cite{balandat2020botorch}.  Standard and spherical models are
+fit with \texttt{fit\_gpytorch\_mll} using exact or summed marginal log
+likelihoods; configured kernel and likelihood priors are included in that
+fitting objective.  Table~\ref{tab:optimization-config} collects the proposal
+settings that determine the evaluation accounting.  Additional kernel and
+trust-region details are given in Appendix~\ref{app:implementation}.
+
+\begin{table}[ht]
+\centering
+\caption{Optimization configurations used for the reported experiments.}
+\label{tab:optimization-config}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccl}
+\toprule
+Method family & Initial & Adaptive & Proposal structure & Raw/restarts \\
+\midrule
+qLogEHVI & 5 & 40 & sequential & 128/8 \\
+Low-dimensional STCH & 5 & 40 & 5 weights $\times$ 8 & 128/8 \\
+Spherical STCH & 20 & 100 & 5 weights $\times$ 20 & 256/10 \\
+MORBO & 20 & 100 & 20 batches $\times$ 5 & 512/-- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\caption{Relative composite gain in time-averaged hypervolume over the adaptive
+phase, and mean composite/direct solver-runtime ratio.  Runtime includes GP
+fitting and acquisition but excludes one-time benchmark construction.}
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{llrr}
+\toprule
+Benchmark & Method family & HV-curve gain & Runtime ratio \\
+\midrule
+Color formulation & qLogEHVI & $+14.87\%$ & $4.45\times$ \\
+ & STCH & $+2.70\%$ & $2.48\times$ \\
+DTLZ2 & qLogEHVI & $+119.25\%$ & $2.08\times$ \\
+ & STCH & $+67.19\%$ & $1.37\times$ \\
+Four-bar truss & qLogEHVI & $+2.91\%$ & $2.85\times$ \\
+ & STCH & $+5.16\%$ & $3.07\times$ \\
+Langermann--Ackley & spherical STCH & $+6.67\%$ & $6.47\times$ \\
+ & MORBO & $+3.37\%$ & $3.84\times$ \\
+Shallow lake & spherical STCH & $+4.80\%$ & $10.49\times$ \\
+ & MORBO & $+2.59\%$ & $5.93\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Mean runtimes in seconds (direct $\rightarrow$ composite) were:
+color qLogEHVI $114.7\rightarrow511.0$, color STCH
+$92.9\rightarrow230.9$; DTLZ2 qLogEHVI $79.3\rightarrow165.2$, DTLZ2 STCH
+$99.7\rightarrow136.4$; truss qLogEHVI $83.1\rightarrow237.1$, truss STCH
+$67.1\rightarrow206.1$; Langermann--Ackley spherical STCH
+$1860.4\rightarrow12036.4$, Langermann--Ackley MORBO
+$1104.9\rightarrow4241.9$; shallow-lake spherical STCH
+$1808.7\rightarrow18967.7$, and shallow-lake MORBO
+$227.6\rightarrow1349.3$.  These are descriptive cluster wall times and were
+not normalized for node contention or hardware variation.
 
 \end{document}

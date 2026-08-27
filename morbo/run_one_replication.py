@@ -167,6 +167,7 @@ def run_one_replication(
     raw_evaluate: Optional[Callable[[Tensor], Tensor]] = None,
     raw_evaluate_components: Optional[Callable[[Tensor], Tensor]] = None,
     raw_compose: Optional[Callable[[Tensor], Tensor]] = None,
+    raw_num_outputs: Optional[int] = None,
     dtype: torch.device = torch.double,
     device: Optional[torch.device] = None,
     save_callback: Optional[Callable[[Tensor], None]] = None,
@@ -393,9 +394,16 @@ def run_one_replication(
                     "be set."
                 )
             f = raw_evaluate_components
-            with torch.no_grad():
-                probe = raw_evaluate_components(torch.rand(2, dim, **tkwargs))
-            num_outputs = probe.shape[-1]
+            if raw_num_outputs is None:
+                with torch.no_grad():
+                    probe = raw_evaluate_components(torch.rand(2, dim, **tkwargs))
+                num_outputs = probe.shape[-1]
+            elif raw_num_outputs < 1:
+                raise ValueError("raw_num_outputs must be positive.")
+            else:
+                # Supplying the known width avoids two unrecorded calls to an
+                # expensive scientific simulator just to infer tensor shape.
+                num_outputs = raw_num_outputs
             # `raw_compose` follows `raw_evaluate`'s minimize convention, so
             # (matching `composite_dtlz2_reduction`) it must perform its own
             # negation here -- `negate=False` is set for this evalfn below

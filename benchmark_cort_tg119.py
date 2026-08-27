@@ -133,6 +133,16 @@ class CORTTG119Oracle:
             flush=True,
         )
 
+    def prepare(self) -> None:
+        """Load public matrices and fixed normalizers outside solver timing."""
+
+        self._load()
+
+    def clear_evaluation_cache(self) -> None:
+        """Prevent evaluated designs from leaking between solver runs."""
+
+        self._cache.clear()
+
     def _dose_components(self, normalized_X: np.ndarray) -> np.ndarray:
         if self._target is None or self._core is None or self._normal is None:
             raise RuntimeError("CORT matrices have not been loaded")

@@ -438,7 +438,8 @@ def TS_select_batch_MORBO(trbo_state: TRBOState) -> CandidateSelectionOutput:
                         value_score[better_than_ref] = hvi
                     else:
                         selection_rule = 2
-                        print(f"{i}) Breaking ties using a random scalarization")
+                        if trbo_state.tr_hparams.verbose:
+                            print(f"{i}) Breaking ties using a random scalarization")
                         weights = sample_simplex(
                             d=trbo_state.num_objectives, n=1, **tkwargs
                         )
@@ -470,8 +471,11 @@ def TS_select_batch_MORBO(trbo_state: TRBOState) -> CandidateSelectionOutput:
     # NOTE: tr.bounds is the same for all TRs, so we can use any of them
     X_next = unnormalize(X=X_next, bounds=tr.bounds)
 
-    print(f"Time spent on sampling: {time_sampling:.1f} seconds")
-    print(f"Time spent on HVI computations: {time_hvi:.1f} seconds")
-    tr_counts = [(tr_indices_selected == i).sum().cpu().item() for i in range(n_trs)]
-    print(f"Number of points selected from each TR: {tr_counts}")
+    if trbo_state.tr_hparams.verbose:
+        print(f"Time spent on sampling: {time_sampling:.1f} seconds")
+        print(f"Time spent on HVI computations: {time_hvi:.1f} seconds")
+        tr_counts = [
+            (tr_indices_selected == i).sum().cpu().item() for i in range(n_trs)
+        ]
+        print(f"Number of points selected from each TR: {tr_counts}")
     return CandidateSelectionOutput(X_cand=X_next, tr_indices=tr_indices_selected)

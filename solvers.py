@@ -235,8 +235,11 @@ def composite_mobo(
 
     torch.manual_seed(seed)
     X = _sobol(n_init, dim, seed)
-    C, Y = evaluate_components(X).double(), evaluate(X).double()
-    _check_composition(C, Y, compose)
+    # A component observation and its composed objective are one expensive
+    # design evaluation.  Reconstruct Y from the observed components instead
+    # of calling the simulator a second time.
+    C = evaluate_components(X).double()
+    Y = compose(C).double()
     ref_max = -torch.as_tensor(ref_point, dtype=torch.double)
     objective = GenericMCMultiOutputObjective(lambda samples, X=None: -compose(samples))
     for _ in range(n_iter):
@@ -249,7 +252,8 @@ def composite_mobo(
             objective=objective,
         )
         x = _optimize(acq, dim, raw_samples, num_restarts)
-        c, y = evaluate_components(x).double(), evaluate(x).double()
+        c = evaluate_components(x).double()
+        y = compose(c).double()
         X, C, Y = torch.cat((X, x)), torch.cat((C, c)), torch.cat((Y, y))
     return SolverResult(X=X, Y=Y, components=C)
 
@@ -271,18 +275,14 @@ def _scalarized_runs(
     """Branch every weight from one shared, once-evaluated initial design."""
     torch.manual_seed(seed)
     X_initial = _sobol(n_init, dim, seed)
-    Y_initial = evaluate(X_initial).double()
-    C_initial = (
-        evaluate_components(X_initial).double()
-        if evaluate_components is not None
-        else None
-    )
-    if C_initial is not None:
-        _check_composition(C_initial, Y_initial, compose)  # type: ignore[arg-type]
+    if evaluate_components is None:
+        C_initial = None
+        Y_initial = evaluate(X_initial).double()
+    else:
+        C_initial = evaluate_components(X_initial).double()
+        Y_initial = compose(C_initial).double()  # type: ignore[misc]
 
-    all_x, all_y = [X_initial], [Y_initial]
-    all_c = [C_initial] if C_initial is not None else []
-    ids = [torch.full((n_init,), -1, dtype=torch.long)]
+    branch_x, branch_y, branch_c = [], [], []
     for weight_id, weight in enumerate(weights.double()):
         torch.manual_seed(seed + 104729 * weight_id)
         X, Y = X_initial.clone(), Y_initial.clone()
@@ -312,21 +312,46 @@ def _scalarized_runs(
                 model=model, best_f=observed_utility.max(), objective=objective
             )
             x = _optimize(acq, dim, raw_samples, num_restarts)
-            y = evaluate(x).double()
-            X, Y = torch.cat((X, x)), torch.cat((Y, y))
             if C is not None:
-                C = torch.cat((C, evaluate_components(x).double()))  # type: ignore[misc]
-        all_x.append(X[n_init:])
-        all_y.append(Y[n_init:])
-        ids.append(torch.full((n_per_scalarization,), weight_id, dtype=torch.long))
+                c = evaluate_components(x).double()  # type: ignore[misc]
+                y = compose(c).double()  # type: ignore[misc]
+                C = torch.cat((C, c))
+            else:
+                y = evaluate(x).double()
+            X, Y = torch.cat((X, x)), torch.cat((Y, y))
+        branch_x.append(X[n_init:])
+        branch_y.append(Y[n_init:])
         if C is not None:
-            all_c.append(C[n_init:])
+            branch_c.append(C[n_init:])
+    # The scalarization runs are independent after the shared initial design.
+    # Log them in round-robin evaluation order (one point from every weight per
+    # round), rather than placing an entire weight trajectory before the next.
+    # This removes an arbitrary weight-order artifact from HV-vs-evaluation.
+    adaptive_x = torch.stack(branch_x, dim=1).reshape(-1, dim)
+    adaptive_y = torch.stack(branch_y, dim=1).reshape(-1, Y_initial.shape[-1])
+    adaptive_ids = torch.arange(len(weights), dtype=torch.long).repeat(
+        n_per_scalarization
+    )
+    adaptive_c = (
+        torch.stack(branch_c, dim=1).reshape(-1, C_initial.shape[-1])
+        if C_initial is not None
+        else None
+    )
     return SolverResult(
-        X=torch.cat(all_x),
-        Y=torch.cat(all_y),
-        components=torch.cat(all_c) if all_c else None,
+        X=torch.cat((X_initial, adaptive_x)),
+        Y=torch.cat((Y_initial, adaptive_y)),
+        components=(
+            torch.cat((C_initial, adaptive_c))
+            if C_initial is not None and adaptive_c is not None
+            else None
+        ),
         weights=weights,
-        run_ids=torch.cat(ids),
+        run_ids=torch.cat(
+            (
+                torch.full((n_init,), -1, dtype=torch.long),
+                adaptive_ids,
+            )
+        ),
     )
 
 
@@ -495,18 +520,14 @@ def _high_dim_scalarized_runs(
     """Spherical-linear STCH with one shared initial design."""
     torch.manual_seed(seed)
     X_initial = _sobol(n_init, dim, seed)
-    Y_initial = evaluate(X_initial).double()
-    C_initial = (
-        evaluate_components(X_initial).double()
-        if evaluate_components is not None
-        else None
-    )
-    if C_initial is not None:
-        _check_composition(C_initial, Y_initial, compose)  # type: ignore[arg-type]
+    if evaluate_components is None:
+        C_initial = None
+        Y_initial = evaluate(X_initial).double()
+    else:
+        C_initial = evaluate_components(X_initial).double()
+        Y_initial = compose(C_initial).double()  # type: ignore[misc]
 
-    all_x, all_y = [X_initial], [Y_initial]
-    all_c = [C_initial] if C_initial is not None else []
-    all_ids = [torch.full((n_init,), -1, dtype=torch.long)]
+    branch_x, branch_y, branch_c = [], [], []
     for weight_id, weight in enumerate(weights.double()):
         torch.manual_seed(seed + 104729 * weight_id)
         X, Y = X_initial.clone(), Y_initial.clone()
@@ -536,21 +557,42 @@ def _high_dim_scalarized_runs(
                 model=model, best_f=observed_utility.max(), objective=objective
             )
             x = _optimize(acq, dim, raw_samples, num_restarts)
-            y = evaluate(x).double()
-            X, Y = torch.cat((X, x)), torch.cat((Y, y))
             if C is not None:
-                C = torch.cat((C, evaluate_components(x).double()))  # type: ignore[misc]
-        all_x.append(X[n_init:])
-        all_y.append(Y[n_init:])
-        all_ids.append(torch.full((n_per_scalarization,), weight_id, dtype=torch.long))
+                c = evaluate_components(x).double()  # type: ignore[misc]
+                y = compose(c).double()  # type: ignore[misc]
+                C = torch.cat((C, c))
+            else:
+                y = evaluate(x).double()
+            X, Y = torch.cat((X, x)), torch.cat((Y, y))
+        branch_x.append(X[n_init:])
+        branch_y.append(Y[n_init:])
         if C is not None:
-            all_c.append(C[n_init:])
+            branch_c.append(C[n_init:])
+    adaptive_x = torch.stack(branch_x, dim=1).reshape(-1, dim)
+    adaptive_y = torch.stack(branch_y, dim=1).reshape(-1, Y_initial.shape[-1])
+    adaptive_ids = torch.arange(len(weights), dtype=torch.long).repeat(
+        n_per_scalarization
+    )
+    adaptive_c = (
+        torch.stack(branch_c, dim=1).reshape(-1, C_initial.shape[-1])
+        if C_initial is not None
+        else None
+    )
     return SolverResult(
-        X=torch.cat(all_x),
-        Y=torch.cat(all_y),
-        components=torch.cat(all_c) if all_c else None,
+        X=torch.cat((X_initial, adaptive_x)),
+        Y=torch.cat((Y_initial, adaptive_y)),
+        components=(
+            torch.cat((C_initial, adaptive_c))
+            if C_initial is not None and adaptive_c is not None
+            else None
+        ),
         weights=weights,
-        run_ids=torch.cat(all_ids),
+        run_ids=torch.cat(
+            (
+                torch.full((n_init,), -1, dtype=torch.long),
+                adaptive_ids,
+            )
+        ),
     )
 
 
@@ -655,10 +697,12 @@ def _morbo(
     failure_streak = cfg.failure_streak or max(dim // 3, 10)
     torch.manual_seed(seed)
     X = _sobol(n_init, dim, seed)
-    Y = evaluate(X).double()
-    C = evaluate_components(X).double() if evaluate_components else None
-    if C is not None:
-        _check_composition(C, Y, compose)  # type: ignore[arg-type]
+    if evaluate_components is None:
+        C = None
+        Y = evaluate(X).double()
+    else:
+        C = evaluate_components(X).double()
+        Y = compose(C).double()  # type: ignore[misc]
     ref = -torch.as_tensor(ref_point, dtype=torch.double)
     ntr = cfg.n_trust_regions
     pareto_ids = torch.where(
@@ -708,10 +752,13 @@ def _morbo(
                     tr,
                 )
         x = best_x
-        y = evaluate(x).double()  # type: ignore[arg-type]
-        X, Y = torch.cat((X, x)), torch.cat((Y, y))
         if C is not None:
-            C = torch.cat((C, evaluate_components(x).double()))  # type: ignore[misc]
+            c = evaluate_components(x).double()  # type: ignore[misc]
+            y = compose(c).double()  # type: ignore[misc]
+            C = torch.cat((C, c))
+        else:
+            y = evaluate(x).double()  # type: ignore[arg-type]
+        X, Y = torch.cat((X, x)), torch.cat((Y, y))
         new_hv = _hv_max(-Y, ref)
         if new_hv > previous_hv + 1e-3 * max(abs(previous_hv), 1.0):
             successes[best_tr] += 1
@@ -788,6 +835,7 @@ def _batched_morbo(
     min_tr_size: Optional[int] = None,
     evaluate_components: Optional[Evaluator] = None,
     compose: Optional[Composer] = None,
+    num_components: Optional[int] = None,
 ) -> SolverResult:
     cfg = config or MORBOConfig()
     ref_point_t = torch.as_tensor(ref_point, dtype=torch.double)
@@ -821,6 +869,7 @@ def _batched_morbo(
         extra = dict(
             raw_evaluate_components=raw_evaluate_components,
             raw_compose=raw_compose,
+            raw_num_outputs=num_components,
         )
     else:
         def raw_evaluate(X: Tensor) -> Tensor:

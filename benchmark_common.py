@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import gc
+import json
 from pathlib import Path
 import time
 from typing import Callable, Literal
@@ -23,12 +24,12 @@ from botorch.utils.multi_objective.pareto import is_non_dominated
 from solvers import (
     MORBOConfig,
     SolverResult,
+    batched_morbo,
     chebyshev_bo,
     composite_chebyshev_bo,
     composite_mobo,
-    composite_morbo,
+    composite_batched_morbo,
     composite_spherical_chebyshev_bo,
-    morbo,
     simplex_weights,
     spherical_chebyshev_bo,
     standard_mobo,
@@ -56,27 +57,21 @@ class BenchmarkProblem:
     compose: Composer
     ideal: Tensor
     ref_point: Tensor
+    num_components: int | None = None
     exact_max_hypervolume: float | None = None
+    prepare: Callable[[], None] | None = None
+    clear_evaluation_cache: Callable[[], None] | None = None
 
     def evaluate(self, X: Tensor) -> Tensor:
         return self.compose(self.evaluate_components(X))
 
     def validate(self) -> None:
+        """Validate metadata without spending an unrecorded simulator call."""
+
         if self.dim < 1 or self.num_objectives < 2:
             raise ValueError("invalid benchmark dimensions")
-        probe = (
-            torch.quasirandom.SobolEngine(self.dim, scramble=True, seed=1729)
-            .draw(8)
-            .double()
-        )
-        components = self.evaluate_components(probe).double()
-        objectives = self.compose(components).double()
-        if components.ndim != 2 or components.shape[0] != len(probe):
-            raise ValueError("components must have shape n x number_of_components")
-        if objectives.shape != (len(probe), self.num_objectives):
-            raise ValueError("objectives must have shape n x number_of_objectives")
-        if not torch.isfinite(components).all() or not torch.isfinite(objectives).all():
-            raise ValueError("benchmark returned a non-finite value")
+        if self.num_components is not None and self.num_components < 1:
+            raise ValueError("num_components must be positive")
         if self.ideal.shape != (self.num_objectives,):
             raise ValueError("ideal point has the wrong shape")
         if self.ref_point.shape != (self.num_objectives,):
@@ -225,44 +220,29 @@ def dominated_hypervolume_trace(Y: Tensor, ref_point: Tensor) -> np.ndarray:
 
 def _argument_parser(problem: BenchmarkProblem) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=f"Run 20-trial BO comparisons on {problem.name}."
+        description=f"Run 10-trial BO comparisons on {problem.name}."
     )
-    parser.add_argument("--trials", type=int, default=20)
-    parser.add_argument("--initial", type=int, default=5)
+    parser.add_argument("--trials", type=int, default=10)
+    parser.add_argument(
+        "--initial", type=int, default=5 if problem.suite == "low" else 20
+    )
     parser.add_argument(
         "--evaluations",
         type=int,
-        default=50 if problem.suite == "low" else 400,
-        help=(
-            "target total expensive evaluations per method; STCH uses the "
-            "largest equal allocation across all weights that does not exceed "
-            "this target"
-        ),
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=None,
-        help=(
-            "override adaptive evaluations for qLogEHVI/MORBO "
-            "(default: --evaluations minus --initial)"
-        ),
+        default=45 if problem.suite == "low" else 120,
+        help="exact total expensive design evaluations per method",
     )
     parser.add_argument(
         "--weights",
         type=int,
-        default=4 if problem.suite == "low" else 10,
+        default=5,
         help="number of smooth-Tchebycheff scalarization weights",
     )
     parser.add_argument(
         "--per-weight",
         type=int,
-        default=10 if problem.suite == "low" else None,
-        help=(
-            "override adaptive evaluations per STCH weight "
-            "(low-dimensional default: 10; high-dimensional default: largest "
-            "equal allocation within --evaluations)"
-        ),
+        default=None,
+        help="override evaluations per STCH weight; must exactly fill the budget",
     )
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument(
@@ -273,11 +253,17 @@ def _argument_parser(problem: BenchmarkProblem) -> argparse.ArgumentParser:
     )
     parser.add_argument("--morbo-raw-samples", type=int, default=512)
     parser.add_argument("--trust-regions", type=int, default=5)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5,
+        help="joint MORBO batch size (high-dimensional suite only)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--output",
+        "--output-dir",
         type=Path,
-        default=Path(f"hypervolume_{problem.slug}.png"),
+        default=Path("benchmark_results") / problem.slug,
     )
     parser.add_argument("--show", action="store_true", help="also open the plot window")
     parser.add_argument(
@@ -293,13 +279,13 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         "trials",
         "initial",
         "evaluations",
-        "iterations",
         "weights",
         "per_weight",
         "raw_samples",
         "restarts",
         "morbo_raw_samples",
         "trust_regions",
+        "batch_size",
     )
     for name in positive:
         if getattr(args, name) < 1:
@@ -312,13 +298,13 @@ def _quick_arguments(args: argparse.Namespace) -> None:
     args.trials = 1
     args.initial = 3
     args.evaluations = 5
-    args.iterations = 1
     args.weights = 2
     args.per_weight = 1
     args.raw_samples = 16
     args.restarts = 2
     args.morbo_raw_samples = 32
     args.trust_regions = 2
+    args.batch_size = 1
 
 
 def _solver_jobs(
@@ -338,14 +324,14 @@ def _solver_jobs(
     if problem.suite == "low":
         sequential_common = {
             "n_init": args.initial,
-            "n_iter": args.iterations,
+            "n_iter": args.evaluations - args.initial,
             "seed": seed,
             "raw_samples": args.raw_samples,
             "num_restarts": args.restarts,
         }
         jobs = [
             (
-                "Direct qLogEHVI",
+                "Hypervolume",
                 "qlogehvi",
                 lambda: standard_mobo(
                     problem.evaluate,
@@ -355,7 +341,7 @@ def _solver_jobs(
                 ),
             ),
             (
-                "Composite qLogEHVI",
+                "Composite hypervolume",
                 "qlogehvi",
                 lambda: composite_mobo(
                     problem.evaluate,
@@ -367,7 +353,7 @@ def _solver_jobs(
                 ),
             ),
             (
-                "Objective-GP STCH",
+                "Tchebycheff",
                 "stch",
                 lambda: chebyshev_bo(
                     problem.evaluate,
@@ -378,7 +364,7 @@ def _solver_jobs(
                 ),
             ),
             (
-                "Composite STCH",
+                "Composite Tchebycheff",
                 "stch",
                 lambda: composite_chebyshev_bo(
                     problem.evaluate,
@@ -392,8 +378,11 @@ def _solver_jobs(
             ),
         ]
         panels = [
-            ("qLogEHVI", ["Direct qLogEHVI", "Composite qLogEHVI"]),
-            ("Smooth Tchebycheff", ["Objective-GP STCH", "Composite STCH"]),
+            ("Hypervolume", ["Hypervolume", "Composite hypervolume"]),
+            (
+                "Smooth Tchebycheff",
+                ["Tchebycheff", "Composite Tchebycheff"],
+            ),
         ]
         return jobs, panels
 
@@ -402,13 +391,14 @@ def _solver_jobs(
     )
     morbo_common = {
         "n_init": args.initial,
-        "n_iter": args.iterations,
+        "n_iter": (args.evaluations - args.initial) // args.batch_size,
         "seed": seed,
         "config": morbo_config,
+        "batch_size": args.batch_size,
     }
     jobs = [
         (
-            "Spherical objective STCH",
+            "Spherical Tchebycheff",
             "stch",
             lambda: spherical_chebyshev_bo(
                 problem.evaluate,
@@ -419,7 +409,7 @@ def _solver_jobs(
             ),
         ),
         (
-            "Spherical composite STCH",
+            "Composite spherical Tchebycheff",
             "stch",
             lambda: composite_spherical_chebyshev_bo(
                 problem.evaluate,
@@ -434,7 +424,7 @@ def _solver_jobs(
         (
             "MORBO",
             "morbo",
-            lambda: morbo(
+            lambda: batched_morbo(
                 problem.evaluate,
                 problem.dim,
                 problem.ref_point,
@@ -444,12 +434,13 @@ def _solver_jobs(
         (
             "Composite MORBO",
             "morbo",
-            lambda: composite_morbo(
+            lambda: composite_batched_morbo(
                 problem.evaluate,
                 problem.evaluate_components,
                 problem.compose,
                 problem.dim,
                 problem.ref_point,
+                num_components=problem.num_components,
                 **morbo_common,
             ),
         ),
@@ -457,7 +448,7 @@ def _solver_jobs(
     panels = [
         (
             "Spherical-linear smooth Tchebycheff",
-            ["Spherical objective STCH", "Spherical composite STCH"],
+            ["Spherical Tchebycheff", "Composite spherical Tchebycheff"],
         ),
         ("MORBO", ["MORBO", "Composite MORBO"]),
     ]
@@ -489,7 +480,7 @@ def _plot_traces(
                 sem = np.zeros_like(mean)
             evaluations = np.arange(1, len(mean) + 1)
             longest_trace = max(longest_trace, len(mean))
-            linestyle = ":" if "Composite" in method_name else "-"
+            linestyle = "--" if "Composite" in method_name else "-"
             ax.plot(
                 evaluations,
                 mean,
@@ -548,24 +539,109 @@ def run_benchmark(problem: BenchmarkProblem) -> None:
     args = parser.parse_args()
     if args.quick:
         _quick_arguments(args)
-    if args.iterations is None:
-        args.iterations = args.evaluations - args.initial
     if args.per_weight is None:
-        args.per_weight = (args.evaluations - args.initial) // args.weights
+        remaining = args.evaluations - args.initial
+        if remaining % args.weights:
+            raise ValueError(
+                "--evaluations minus --initial must be divisible by --weights"
+            )
+        args.per_weight = remaining // args.weights
     _validate_arguments(args)
+    if args.initial >= args.evaluations:
+        raise ValueError("--initial must be smaller than --evaluations")
+    expected_scalar_budget = args.initial + args.weights * args.per_weight
+    if expected_scalar_budget != args.evaluations:
+        raise ValueError(
+            "--initial + --weights * --per-weight must equal --evaluations"
+        )
+    if problem.suite == "high":
+        remaining = args.evaluations - args.initial
+        if remaining % args.batch_size:
+            raise ValueError(
+                "high-dimensional --evaluations minus --initial must be "
+                "divisible by --batch-size"
+            )
     problem.validate()
+    # Dataset loading and fixed benchmark-constant construction are setup,
+    # not BO runtime. Scientific evaluators can perform that work once here.
+    if problem.prepare is not None:
+        problem.prepare()
 
     traces: dict[str, list[np.ndarray]] = {}
+    designs: dict[str, list[np.ndarray]] = {}
+    objectives: dict[str, list[np.ndarray]] = {}
+    components: dict[str, list[np.ndarray]] = {}
+    run_ids: dict[str, list[np.ndarray]] = {}
+    scalarization_weights: dict[str, list[np.ndarray]] = {}
+    runtimes: dict[str, list[float]] = {}
     panels: list[tuple[str, list[str]]] | None = None
     for trial in range(args.trials):
         seed = args.seed + 10_007 * trial
         jobs, panels = _solver_jobs(problem, args, seed)
-        for method_name, _, job in jobs:
+        initial_designs_by_family: dict[str, torch.Tensor] = {}
+        for method_name, family_name, job in jobs:
+            # Never let a method inherit simulator results from the method run
+            # before it. Within-method memoization is still available for an
+            # optimizer that deliberately revisits the same design.
+            if problem.clear_evaluation_cache is not None:
+                problem.clear_evaluation_cache()
             started = time.perf_counter()
             result = job()
+            if len(result.Y) != args.evaluations:
+                raise RuntimeError(
+                    f"{method_name} used {len(result.Y)} evaluations; "
+                    f"expected exactly {args.evaluations}"
+                )
+            if result.Y.shape != (args.evaluations, problem.num_objectives):
+                raise RuntimeError(
+                    f"{method_name} returned objective shape {tuple(result.Y.shape)}"
+                )
+            if not torch.isfinite(result.Y).all():
+                raise RuntimeError(f"{method_name} returned a non-finite objective")
+            if result.X.shape != (args.evaluations, problem.dim):
+                raise RuntimeError(
+                    f"{method_name} returned design shape {tuple(result.X.shape)}"
+                )
+            if family_name not in initial_designs_by_family:
+                initial_designs_by_family[family_name] = (
+                    result.X[: args.initial].detach().cpu()
+                )
+            elif not torch.equal(
+                initial_designs_by_family[family_name],
+                result.X[: args.initial].detach().cpu(),
+            ):
+                raise RuntimeError(
+                    f"{method_name} did not use its paired method's initial design"
+                )
+            if result.components is not None and problem.num_components is not None:
+                expected = (args.evaluations, problem.num_components)
+                if result.components.shape != expected:
+                    raise RuntimeError(
+                        f"{method_name} returned component shape "
+                        f"{tuple(result.components.shape)}; expected {expected}"
+                    )
             trace = dominated_hypervolume_trace(result.Y, problem.ref_point)
             traces.setdefault(method_name, []).append(trace)
+            designs.setdefault(method_name, []).append(
+                result.X.detach().double().cpu().numpy()
+            )
+            objectives.setdefault(method_name, []).append(
+                result.Y.detach().double().cpu().numpy()
+            )
+            if result.components is not None:
+                components.setdefault(method_name, []).append(
+                    result.components.detach().double().cpu().numpy()
+                )
+            if result.run_ids is not None:
+                run_ids.setdefault(method_name, []).append(
+                    result.run_ids.detach().cpu().numpy()
+                )
+            if result.weights is not None:
+                scalarization_weights.setdefault(method_name, []).append(
+                    result.weights.detach().double().cpu().numpy()
+                )
             elapsed = time.perf_counter() - started
+            runtimes.setdefault(method_name, []).append(elapsed)
             print(
                 f"{problem.slug:<30} trial={trial + 1:02d}/{args.trials:02d} "
                 f"{method_name:<28} HV={trace[-1]:.6f} time={elapsed:.1f}s",
@@ -581,6 +657,77 @@ def run_benchmark(problem: BenchmarkProblem) -> None:
         traces,
         panels,
         args.initial,
-        args.output,
+        args.output_dir / "hypervolume_vs_evaluations.png",
         args.show,
     )
+    method_names = list(traces)
+    archive_path = args.output_dir / "benchmark_data.npz"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "problem": problem.name,
+        "slug": problem.slug,
+        "suite": problem.suite,
+        "dimension": problem.dim,
+        "num_objectives": problem.num_objectives,
+        "num_components": problem.num_components,
+        "trials": args.trials,
+        "initial_evaluations": args.initial,
+        "total_evaluations": args.evaluations,
+        "weights": args.weights,
+        "evaluations_per_weight": args.per_weight,
+        "temperature": args.temperature,
+        "scalarization_trace_order": "round_robin_by_weight",
+        "acquisition_raw_samples": args.raw_samples,
+        "acquisition_restarts": args.restarts,
+        "acquisition_optimizer_maxiter": 200,
+        "base_seed": args.seed,
+        "trial_seed_stride": 10_007,
+        "morbo_batch_size": args.batch_size if problem.suite == "high" else None,
+        "morbo_raw_samples": (
+            args.morbo_raw_samples if problem.suite == "high" else None
+        ),
+        "morbo_trust_regions": (
+            args.trust_regions if problem.suite == "high" else None
+        ),
+        "morbo_success_streak": 10_000 if problem.suite == "high" else None,
+        "morbo_failure_streak": (
+            max(problem.dim // 3, 10) if problem.suite == "high" else None
+        ),
+        "morbo_min_tr_size": (
+            max(1, min(args.initial - 1, 20))
+            if problem.suite == "high"
+            else None
+        ),
+        "morbo_engine": "vendored batched MORBO" if problem.suite == "high" else None,
+        "evaluation_cache_reset_per_method": True,
+        "methods": method_names,
+    }
+    archive_arrays: dict[str, np.ndarray] = {
+        "method_names": np.asarray(method_names),
+        "evaluation": np.arange(1, args.evaluations + 1, dtype=np.int64),
+        "hypervolume": np.stack([np.stack(traces[name]) for name in method_names]),
+        "designs": np.stack([np.stack(designs[name]) for name in method_names]),
+        "objectives": np.stack([np.stack(objectives[name]) for name in method_names]),
+        "runtimes_seconds": np.stack(
+            [np.asarray(runtimes[name], dtype=np.float64) for name in method_names]
+        ),
+        "seeds": np.asarray(
+            [args.seed + 10_007 * trial for trial in range(args.trials)],
+            dtype=np.int64,
+        ),
+        "ideal": problem.ideal.detach().double().cpu().numpy(),
+        "reference_point": problem.ref_point.detach().double().cpu().numpy(),
+        "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
+    }
+    for method_name in method_names:
+        key = "_".join(method_name.lower().split())
+        if method_name in components:
+            archive_arrays[f"components__{key}"] = np.stack(components[method_name])
+        if method_name in run_ids:
+            archive_arrays[f"run_ids__{key}"] = np.stack(run_ids[method_name])
+        if method_name in scalarization_weights:
+            archive_arrays[f"weights__{key}"] = np.stack(
+                scalarization_weights[method_name]
+            )
+    np.savez_compressed(archive_path, **archive_arrays)
+    print(f"Saved NumPy data: {archive_path.resolve()}")
